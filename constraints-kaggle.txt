@@ -7,6 +7,8 @@ opencv-contrib-python==4.11.0.86
 jax==0.4.35
 jaxlib==0.4.35
 protobuf>=4.25.3,<5
+# Faster-Whisper 1.2.1 passes metadata_errors to av.open; PyAV 19 removed it.
+av>=11,<19
 
 # Preserve the speaker-diarization-3.1 / torchaudio API used by the application.
 # New pyannote.core/metrics major versions require NumPy 2.

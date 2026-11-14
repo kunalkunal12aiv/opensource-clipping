@@ -6,29 +6,22 @@ from __future__ import annotations
 
 import os
 import asyncio
-from functools import lru_cache
 import shutil
 import subprocess
+from pathlib import Path
 
-from fastapi import APIRouter
+from dotenv import set_key
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
 from ..models import SettingsRequest, SettingsResponse, SystemHealthResponse
+from .. import config_adapter
 from .. import store as job_store
 from .. import worker
+from ..hardware import cuda_available
 from ..readiness import get_readiness
 
 router = APIRouter(tags=["settings"])
-
-
-@lru_cache(maxsize=1)
-def _check_gpu() -> bool:
-    """Check if CUDA GPU is available."""
-    try:
-        import torch
-        return torch.cuda.is_available()
-    except Exception:
-        return False
 
 
 def _check_ffmpeg() -> bool:
@@ -44,10 +37,42 @@ def _check_ffmpeg() -> bool:
         return False
 
 
+def _persist_api_keys(env_updates: dict[str, str]) -> None:
+    """Persist API keys to the repository's git-ignored .env without logging values."""
+    api_keys = {
+        key: value
+        for key, value in env_updates.items()
+        if key in {"GOOGLE_API_KEY", "PEXELS_API_KEY", "HF_TOKEN", "NVIDIA_API_KEY"}
+    }
+    if not api_keys:
+        return
+
+    env_path = Path(config_adapter.PROJECT_ROOT) / ".env"
+    try:
+        for key, value in api_keys.items():
+            set_key(str(env_path), key, value, quote_mode="always")
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save API keys to the local .env file.",
+        ) from exc
+
+
 @router.get("/api/settings")
 async def get_settings() -> SettingsResponse:
     """Get current settings (API keys are masked)."""
     env = worker.get_settings_env()
+    gpu_available = await asyncio.to_thread(cuda_available)
+    default_whisper_device = env.get(
+        "DEFAULT_WHISPER_DEVICE",
+        os.environ.get("DEFAULT_WHISPER_DEVICE", "cuda" if gpu_available else "cpu"),
+    )
+    if not gpu_available and default_whisper_device in {"cuda", "auto"}:
+        default_whisper_device = "cpu"
+    default_whisper_model = env.get(
+        "DEFAULT_WHISPER_MODEL",
+        os.environ.get("DEFAULT_WHISPER_MODEL", "large-v3" if gpu_available else "small"),
+    )
 
     # Check which keys are set (from worker env or os.environ)
     google_key = env.get("GOOGLE_API_KEY", os.environ.get("GOOGLE_API_KEY", ""))
@@ -63,10 +88,10 @@ async def get_settings() -> SettingsResponse:
         default_clips=int(env.get("DEFAULT_CLIPS", "7")),
         default_ratio=env.get("DEFAULT_RATIO", "9:16"),
         default_font_style=env.get("DEFAULT_FONT_STYLE", "HORMOZI"),
-        default_whisper_model=env.get("DEFAULT_WHISPER_MODEL", "large-v3"),
-        default_whisper_device=env.get("DEFAULT_WHISPER_DEVICE", "cuda"),
+        default_whisper_model=default_whisper_model,
+        default_whisper_device=default_whisper_device,
         default_ai_provider=env.get("DEFAULT_AI_PROVIDER", "gemini"),
-        gpu_available=await asyncio.to_thread(_check_gpu),
+        gpu_available=gpu_available,
     )
 
 
@@ -96,6 +121,7 @@ async def update_settings(req: SettingsRequest) -> SettingsResponse:
     if req.default_ai_provider is not None:
         env_updates["DEFAULT_AI_PROVIDER"] = req.default_ai_provider.value if hasattr(req.default_ai_provider, "value") else req.default_ai_provider
 
+    _persist_api_keys(env_updates)
     worker.set_settings_env(env_updates)
 
     return await get_settings()
@@ -105,7 +131,7 @@ async def update_settings(req: SettingsRequest) -> SettingsResponse:
 async def health_check() -> SystemHealthResponse:
     """API liveness and system information; use /api/ready for pipeline readiness."""
     gpu_available, ffmpeg_available = await asyncio.gather(
-        asyncio.to_thread(_check_gpu), asyncio.to_thread(_check_ffmpeg),
+        asyncio.to_thread(cuda_available), asyncio.to_thread(_check_ffmpeg),
     )
     return SystemHealthResponse(
         status="ok",

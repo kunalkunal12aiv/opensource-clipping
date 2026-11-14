@@ -101,6 +101,10 @@ function Settings() {
           {/* API Keys */}
           <div className="settings-section">
             <h3>🔑 API Keys</h3>
+            <p className="form-hint">
+              Saved keys are masked. “Set” confirms a key is saved; leave its field blank to keep it unchanged.
+              Keys are stored in this repository’s git-ignored .env file.
+            </p>
 
             <div className="form-group">
               <label className="form-label">

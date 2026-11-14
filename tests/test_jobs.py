@@ -9,7 +9,7 @@ import pytest
 from web.api.app import app
 from web.api import config_adapter, store, worker
 from web.api.models import ClipDetail, JobStatus
-from web.api.routes import files, jobs
+from web.api.routes import files, jobs, settings
 
 
 @pytest.fixture
@@ -22,6 +22,7 @@ def api(monkeypatch, tmp_path):
     monkeypatch.setattr(worker, "_tasks", {})
     monkeypatch.setattr(worker, "_running_jobs", set())
     monkeypatch.setattr(jobs, "get_readiness", lambda: {"ready": True})
+    monkeypatch.setattr(jobs, "cuda_available", lambda: False)
     submitted = []
     async def submit(job_id, payload): submitted.append((job_id, payload))
     monkeypatch.setattr(worker, "submit_job", submit)
@@ -47,6 +48,110 @@ def test_unready_runtime_does_not_create_or_submit_job(api, monkeypatch):
     assert store.list_jobs() == [] and submitted == []
 
 
+def test_settings_api_keys_persist_without_returning_values(api, monkeypatch):
+    client, root, _ = api
+    monkeypatch.setattr(worker, "_settings_env", {})
+    env_path = root / ".env"
+    env_path.write_text("EXISTING_SETTING=keep\n", encoding="utf-8")
+
+    response = client.put(
+        "/api/settings",
+        json={
+            "google_api_key": "test-google-secret",
+            "nvidia_api_key": "test-nvidia-secret",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["google_api_key_set"] is True
+    assert response.json()["nvidia_api_key_set"] is True
+    assert "test-google-secret" not in response.text
+    assert "test-nvidia-secret" not in response.text
+
+    from dotenv import dotenv_values
+
+    saved = dotenv_values(env_path)
+    assert saved == {
+        "EXISTING_SETTING": "keep",
+        "GOOGLE_API_KEY": "test-google-secret",
+        "NVIDIA_API_KEY": "test-nvidia-secret",
+    }
+
+    monkeypatch.setattr(worker, "_settings_env", {})
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.delenv("PYTHON_DOTENV_DISABLED", raising=False)
+    from dotenv import load_dotenv
+
+    assert load_dotenv(env_path, override=True)
+    reloaded = client.get("/api/settings")
+    assert reloaded.json()["google_api_key_set"] is True
+    assert reloaded.json()["nvidia_api_key_set"] is True
+    assert "test-google-secret" not in reloaded.text
+    assert "test-nvidia-secret" not in reloaded.text
+
+
+def test_cpu_job_defaults_to_int8_and_rejects_float16(api):
+    client, _, submitted = api
+    response = client.post(
+        "/api/jobs",
+        json={"url": "https://example.test/video"},
+    )
+    assert response.status_code == 201, response.text
+    assert submitted[0][1]["whisper_device"] == "cpu"
+    assert submitted[0][1]["whisper_compute_type"] == "int8"
+    assert submitted[0][1]["whisper_model"] == "small"
+
+    response = client.post(
+        "/api/jobs",
+        json={
+            "url": "https://example.test/video",
+            "whisper_device": "cpu",
+            "whisper_compute_type": "float16",
+        },
+    )
+    assert response.status_code == 422
+    assert len(submitted) == 1
+
+
+def test_cuda_job_is_rejected_before_queueing_without_a_gpu(api):
+    client, _, submitted = api
+
+    response = client.post(
+        "/api/jobs",
+        json={"url": "https://example.test/video", "whisper_device": "cuda"},
+    )
+
+    assert response.status_code == 422
+    assert "Select CPU with int8" in response.json()["detail"]
+    assert submitted == []
+    assert store.list_jobs() == []
+
+
+@pytest.mark.parametrize(
+    ("gpu_available", "runtime_settings", "expected_device", "expected_model"),
+    [
+        (False, {"DEFAULT_WHISPER_DEVICE": "cuda"}, "cpu", "small"),
+        (True, {}, "cuda", "large-v3"),
+    ],
+)
+def test_settings_choose_whisper_defaults_for_available_hardware(
+    api, monkeypatch, gpu_available, runtime_settings, expected_device, expected_model,
+):
+    client, _, _ = api
+    monkeypatch.setattr(settings, "cuda_available", lambda: gpu_available)
+    monkeypatch.setattr(worker, "_settings_env", runtime_settings)
+    monkeypatch.delenv("DEFAULT_WHISPER_DEVICE", raising=False)
+    monkeypatch.delenv("DEFAULT_WHISPER_MODEL", raising=False)
+
+    response = client.get("/api/settings")
+
+    assert response.status_code == 200
+    assert response.json()["gpu_available"] is gpu_available
+    assert response.json()["default_whisper_device"] == expected_device
+    assert response.json()["default_whisper_model"] == expected_model
+
+
 @pytest.mark.parametrize("bypass", [True, False])
 def test_reuse_preserves_source_and_honors_bypass_toggle(api, bypass):
     client, root, submitted = api
@@ -56,6 +161,27 @@ def test_reuse_preserves_source_and_honors_bypass_toggle(api, bypass):
     assert response.json()["url"] == "https://example.test/video"
     assert submitted[0][1]["load_gemini_json"] is bypass
     assert submitted[0][1]["url"] is None  # Reuse the original local source.
+
+
+def test_reuse_uploaded_source_uses_cached_ai_response(api):
+    client, root, submitted = api
+    upload_dir = root / "uploads"
+    upload_dir.mkdir()
+    (upload_dir / "video.mp4").write_bytes(b"uploaded video")
+    job_id = store.create_job(upload_filename="video.mp4", source="youtube")
+    output_dir = root / "outputs" / job_id
+    output_dir.mkdir(parents=True)
+    (output_dir / "gemini_response.json").write_text("[]")
+    store.finish_job(job_id)
+
+    response = client.post(
+        "/api/jobs",
+        json={"reuse_job_id": job_id, "load_gemini_json": True},
+    )
+
+    assert response.status_code == 201, response.text
+    assert submitted[0][1]["upload_filename"] == "video.mp4"
+    assert submitted[0][1]["load_gemini_json"] is True
 
 
 def test_reuse_missing_cache_and_active_job_cannot_overwrite_history(api):

@@ -22,6 +22,7 @@ from ..models import (
 from .. import store
 from .. import worker
 from .. import config_adapter
+from ..hardware import cuda_available
 from ..readiness import get_readiness
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
@@ -77,6 +78,12 @@ async def create_job(req: JobCreateRequest) -> JobResponse:
         raise HTTPException(status_code=400, detail="Reuse uses the original source; do not also provide a new source.")
 
     payload = req.model_dump(mode="json")
+
+    if payload["whisper_device"] in {"cuda", "auto"} and not await asyncio.to_thread(cuda_available):
+        raise HTTPException(
+            status_code=422,
+            detail="No usable CUDA GPU is available. Select CPU with int8 to run transcription locally.",
+        )
 
     reuse_job_id = payload.pop("reuse_job_id", None)
     

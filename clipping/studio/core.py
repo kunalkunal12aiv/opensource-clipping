@@ -82,6 +82,7 @@ _ffmpeg_utils = _load_studio_internal_module("ffmpeg_utils.py", "clipping_studio
 
 format_seconds = _helpers.format_seconds
 escape_ffmpeg_filter_value = _helpers.escape_ffmpeg_filter_value
+build_subtitles_filter = _helpers.build_subtitles_filter
 detect_video_encoder = _ffmpeg_utils.detect_video_encoder
 get_ts_encode_args = _ffmpeg_utils.get_ts_encode_args
 get_mp4_encode_args = _ffmpeg_utils.get_mp4_encode_args
@@ -426,9 +427,9 @@ def proses_klip(
                 )
 
                 print("   🎬 [Hook] FFmpeg burn subtitle + audio...")
-                esc_ass_hook = escape_ffmpeg_filter_value(os.path.abspath(a_hook))
-                esc_fontsdir = escape_ffmpeg_filter_value(os.path.abspath(cfg.font_dir))
-                vf_hook_list = [f"subtitles={esc_ass_hook}:fontsdir={esc_fontsdir}"]
+                vf_hook_list = [build_subtitles_filter(
+                    os.path.abspath(a_hook), os.path.abspath(cfg.font_dir),
+                )]
             else:
                 print(f"   🎬 [Hook] Skip subtitle rendering {'(Custom Hook)' if custom_hook else ''}...")
                 vf_hook_list = []
@@ -518,10 +519,9 @@ def proses_klip(
                         get_x_func=get_x_main, source_dim=source_dim,
                     )
 
-                esc_ass_seg = escape_ffmpeg_filter_value(os.path.abspath(s_ass)) if not cfg.no_subs else ""
-                esc_fontsdir_seg = escape_ffmpeg_filter_value(os.path.abspath(cfg.font_dir))
-
-                vf_seg_parts = [f"subtitles={esc_ass_seg}:fontsdir={esc_fontsdir_seg}"] if not cfg.no_subs else []
+                vf_seg_parts = [build_subtitles_filter(
+                    os.path.abspath(s_ass), os.path.abspath(cfg.font_dir),
+                )] if not cfg.no_subs else []
                 if cfg.video_sharpen:
                     vf_seg_parts.append("unsharp=5:5:0.5:5:5:0.0")
 
@@ -662,8 +662,9 @@ def proses_klip(
                 )
 
             print(f"   🎬 [Main] FFmpeg {'skip subtitle' if cfg.no_subs else 'burn subtitle'}...")
-            esc_ass_main = escape_ffmpeg_filter_value(os.path.abspath(a_main)) if not cfg.no_subs else ""
-            esc_fontsdir = escape_ffmpeg_filter_value(os.path.abspath(cfg.font_dir))
+            subtitle_filter = build_subtitles_filter(
+                os.path.abspath(a_main), os.path.abspath(cfg.font_dir),
+            ) if not cfg.no_subs else ""
 
             # SMART BGM
             aktif_bgm = cfg.use_auto_bgm
@@ -691,7 +692,7 @@ def proses_klip(
             for input_silent_ts, output_final_ts in zip(runs, out_targets):
                 lbl_suffix = "" if input_silent_ts == m_silent else " (DEV)"
                 
-                v_filter_parts = [f"subtitles={esc_ass_main}:fontsdir={esc_fontsdir}"] if not cfg.no_subs else []
+                v_filter_parts = [subtitle_filter] if subtitle_filter else []
                 if cfg.video_sharpen:
                     v_filter_parts.append("unsharp=5:5:0.5:5:5:0.0")
                 
@@ -803,9 +804,10 @@ def proses_klip(
                         get_x_func=get_x_main,
                         source_dim=(vo_w, vo_h) 
                     )
-                    esc_ass_vo = escape_ffmpeg_filter_value(os.path.abspath(ass_vo))
-                    esc_fontsdir_vo = escape_ffmpeg_filter_value(os.path.abspath(cfg.font_dir))
-                    ass_vo_filter = f"; [v_over]subtitles={esc_ass_vo}:fontsdir={esc_fontsdir_vo}[v_out]"
+                    subtitle_filter_vo = build_subtitles_filter(
+                        os.path.abspath(ass_vo), os.path.abspath(cfg.font_dir),
+                    )
+                    ass_vo_filter = f"; [v_over]{subtitle_filter_vo}[v_out]"
                     overlay_out = "[v_over]"
 
                 # Generate edge glow overlay video

@@ -110,13 +110,24 @@ for name, modules in {
 versions = {}
 for package in (
     "numpy", "mediapipe", "opencv-python", "opencv-contrib-python",
-    "jax", "jaxlib", "ml-dtypes", "matplotlib", "protobuf",
+    "jax", "jaxlib", "ml-dtypes", "matplotlib", "protobuf", "av",
     "faster-whisper", "torch", "google-genai",
 ):
     try:
         versions[package] = importlib.metadata.version(package)
     except importlib.metadata.PackageNotFoundError:
         pass
+
+av_version = versions.get("av", "")
+av_major = re.match(r"^(\d+)", av_version)
+if av_major and int(av_major.group(1)) >= 19:
+    checks["transcription"] = {
+        "ok": False,
+        "module": "faster_whisper.audio.decode_audio",
+        "error": "IncompatibleDependency",
+        "code": "incompatible_dependency",
+        "message": "PyAV 19+ removed metadata_errors used by Faster-Whisper; install av<19 and restart.",
+    }
 print("OSC_READINESS=" + json.dumps({"checks": checks, "versions": versions}))
 '''
 

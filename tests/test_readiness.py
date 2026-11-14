@@ -133,6 +133,26 @@ def test_child_probe_reports_import_location_without_messages_paths_or_locals(mo
     assert "library URL" not in output
 
 
+def test_child_probe_rejects_pyav_19_for_faster_whisper(monkeypatch, capsys):
+    import importlib
+    import importlib.metadata
+
+    monkeypatch.setattr(importlib, "import_module", lambda name: None)
+    monkeypatch.setattr(
+        importlib.metadata,
+        "version",
+        lambda name: "19.0.2" if name == "av" else "1.2.3",
+    )
+    exec(readiness._PROBE_CODE, {})
+    report = json.loads(capsys.readouterr().out.removeprefix(readiness._RESULT_PREFIX))
+
+    transcription = report["checks"]["transcription"]
+    assert transcription["ok"] is False
+    assert transcription["code"] == "incompatible_dependency"
+    assert "install av<19" in transcription["message"]
+    assert report["versions"]["av"] == "19.0.2"
+
+
 def test_child_probe_bounds_cause_chain_and_reports_missing_dependency(monkeypatch, capsys):
     import importlib
     import importlib.metadata
@@ -163,7 +183,7 @@ def test_readiness_route_does_not_confuse_liveness(monkeypatch):
     from web.api.routes import settings
 
     monkeypatch.setattr(settings, "get_readiness", lambda: {"ready": False, "checks": {"renderer": {"ok": False}}})
-    monkeypatch.setattr(settings, "_check_gpu", lambda: False)
+    monkeypatch.setattr(settings, "cuda_available", lambda: False)
     monkeypatch.setattr(settings, "_check_ffmpeg", lambda: True)
     with TestClient(app) as client:
         assert client.get("/api/health").status_code == 200
@@ -185,7 +205,7 @@ def test_gpu_probe_handles_broken_native_import(monkeypatch):
             raise ValueError("numpy.dtype size changed")
         return original_import(name, *args, **kwargs)
 
-    settings._check_gpu.cache_clear()
+    settings.cuda_available.cache_clear()
     monkeypatch.setattr(builtins, "__import__", import_module)
-    assert settings._check_gpu() is False
-    settings._check_gpu.cache_clear()
+    assert settings.cuda_available() is False
+    settings.cuda_available.cache_clear()

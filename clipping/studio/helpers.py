@@ -32,3 +32,11 @@ def escape_ffmpeg_filter_value(value: str) -> str:
     """
     return str(value).replace("\\", r"\\").replace(":", r"\:").replace("'", r"\'")
 
+
+def build_subtitles_filter(ass_path: str, fonts_dir: str) -> str:
+    """Build a subtitles filter with paths quoted for FFmpeg's filter parser."""
+    return (
+        f"subtitles=filename='{escape_ffmpeg_filter_value(ass_path)}':"
+        f"fontsdir='{escape_ffmpeg_filter_value(fonts_dir)}'"
+    )
+

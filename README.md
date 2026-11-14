@@ -171,7 +171,9 @@ $env:VITE_API_PROXY_TARGET = "http://127.0.0.1:8000"
 npm run dev -- --host 127.0.0.1
 ```
 
-Open `http://127.0.0.1:5173`. Add your Gemini API key in the dashboard's **Settings** before creating clipping jobs. The default proxy target (`http://backend:8000`) is for Docker Compose; set `VITE_API_PROXY_TARGET` when running Vite directly on your machine.
+Open `http://127.0.0.1:5173`. Add your Gemini API key in the dashboard's **Settings** before creating clipping jobs. API keys are stored in the repository's git-ignored `.env` file; their values stay masked in the dashboard, and a **Set** label confirms a saved key. On a machine without a usable GPU, the dashboard defaults to Whisper `small` on **CPU** with `int8`, disables CUDA/Auto, and the API refuses CUDA jobs before they start. The default proxy target (`http://backend:8000`) is for Docker Compose; set `VITE_API_PROXY_TARGET` when running Vite directly on your machine.
+
+Local setup does not require Kaggle. If the transcription backend reports an incompatible PyAV version, update the local environment with `.\.venv\Scripts\python.exe -m pip install -r requirements.txt` and restart the API; Faster-Whisper requires PyAV below 19.
 
 ## 🚀 Local Quick Start
 

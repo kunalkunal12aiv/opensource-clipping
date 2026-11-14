@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import enum
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -107,9 +107,9 @@ class JobCreateRequest(BaseModel):
     font_style: FontStyle = FontStyle.HORMOZI
 
     # Whisper
-    whisper_model: str = "large-v3"
-    whisper_device: WhisperDevice = WhisperDevice.CUDA
-    whisper_compute_type: str = "float16"
+    whisper_model: str = "small"
+    whisper_device: WhisperDevice = WhisperDevice.CPU
+    whisper_compute_type: str = "int8"
     use_dlp_subs: bool = False
 
     # AI
@@ -117,6 +117,25 @@ class JobCreateRequest(BaseModel):
     gemini_model: str = "gemini-3-flash-preview"
     face_detector: FaceDetector = FaceDetector.MEDIAPIPE
     load_gemini_json: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_cpu_compute_type(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        data = data.copy()
+        if data.get("whisper_device") == WhisperDevice.CPU:
+            data.setdefault("whisper_compute_type", "int8")
+        return data
+
+    @model_validator(mode="after")
+    def reject_cpu_float16(self) -> "JobCreateRequest":
+        if (
+            self.whisper_device == WhisperDevice.CPU
+            and self.whisper_compute_type == "float16"
+        ):
+            raise ValueError("Whisper float16 compute type requires a GPU; use int8 or float32 on CPU.")
+        return self
 
     @field_validator("upload_filename")
     @classmethod
@@ -218,8 +237,8 @@ class SettingsResponse(BaseModel):
     default_clips: int = 7
     default_ratio: str = "9:16"
     default_font_style: str = "HORMOZI"
-    default_whisper_model: str = "large-v3"
-    default_whisper_device: str = "cuda"
+    default_whisper_model: str = "small"
+    default_whisper_device: str = "cpu"
     default_ai_provider: str = "gemini"
     gpu_available: bool = False
 

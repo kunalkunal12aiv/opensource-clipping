@@ -1,5 +1,6 @@
 yt-dlp
 faster-whisper
+av>=11,<19
 google-genai
 numpy<2.0.0
 mediapipe

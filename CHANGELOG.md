@@ -11,6 +11,12 @@ All notable changes to the **OpenSource Clipping** project will be documented in
 ## [v1.15.7]
 
 ### Fixed
+- **Faster-Whisper/PyAV compatibility**: Constrain PyAV to versions below 19, where `av.open` still accepts the `metadata_errors` option used by Faster-Whisper 1.2.1. Readiness now reports an actionable dependency error before accepting jobs on an incompatible environment.
+- **Windows subtitle rendering**: Quote escaped ASS and fonts-directory paths in FFmpeg's subtitles filter so Windows drive-letter paths are parsed as values instead of filter options.
+- **Credit-saving uploaded-job reruns**: Clone submissions reuse the original uploaded source without sending it as a new upload, allowing cached AI analysis to be reused instead of billed again.
+- **Local CPU-only transcription**: Default Studio jobs to CPU/int8 and the smaller `small` model when no usable GPU is detected. CUDA/Auto choices are disabled in the dashboard and rejected by the API before a job can start, preventing CUDA driver errors on CPU-only machines.
+- **Studio API key persistence**: Save API keys entered in Settings to the repository's git-ignored `.env` file so they survive API restarts. Settings responses continue to expose only whether a key is set, never its value.
+- **Studio CPU transcription settings**: Default CPU jobs to Whisper `int8`, expose compute type in the dashboard, correct incompatible CPU/`float16` settings when cloning a job, and reject CPU/`float16` API requests before queueing them.
 - **MediaPipe render failure**: Use the pinned BlazeFace short-range model supported by the MediaPipe 0.10.21 Tasks graph. The previous full-range model could initialize but failed on its first image with a tensor box-count assertion. CLI and Studio now share a new cache filename so existing full-range files are not reused or deleted. Short-range detection may be less effective for distant/small faces; the existing YOLO option remains available.
 - **Face detector validation and diagnostics**: Test inference before caching a detector, close failed candidates without hiding the original error, and record the fixed `mediapipe_model_mismatch` category without raw provider/model error text. Correct the MediaPipe image namespace used by automatic speaker counting. Added regression tests and updated both READMEs, the face-tracking Wiki page, and Kaggle troubleshooting instructions.
 

@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
-import { createJob, uploadVideo } from '../api'
+import { createJob, fetchSettings, uploadVideo } from '../api'
 
 function NewJob() {
   const navigate = useNavigate()
@@ -20,8 +20,10 @@ function NewJob() {
   const [ratio, setRatio] = useState('9:16')
   const [source, setSource] = useState('youtube')
   const [fontStyle, setFontStyle] = useState('HORMOZI')
-  const [whisperModel, setWhisperModel] = useState('large-v3')
-  const [whisperDevice, setWhisperDevice] = useState('cuda')
+  const [whisperModel, setWhisperModel] = useState('small')
+  const [whisperDevice, setWhisperDevice] = useState('cpu')
+  const [whisperComputeType, setWhisperComputeType] = useState('int8')
+  const [gpuAvailable, setGpuAvailable] = useState(null)
   const [aiProvider, setAiProvider] = useState('gemini')
 
   // Toggles
@@ -35,10 +37,31 @@ function NewJob() {
   const [useDlpSubs, setUseDlpSubs] = useState(false)
   const [loadGeminiJson, setLoadGeminiJson] = useState(false)
 
+  useEffect(() => {
+    let active = true
+    fetchSettings()
+      .then(settings => {
+        if (!active) return
+        setGpuAvailable(settings.gpu_available)
+        if (!location.state?.reuseJob) {
+          const device = settings.default_whisper_device
+          setWhisperModel(settings.default_whisper_model)
+          setWhisperDevice(device)
+          setWhisperComputeType(device === 'cpu' || device === 'auto' ? 'int8' : 'float16')
+        }
+      })
+      .catch(err => {
+        if (!active) return
+        setGpuAvailable(false)
+        setError(`Could not check GPU availability; using CPU int8 defaults. ${err.message}`)
+      })
+    return () => { active = false }
+  }, [location.state])
+
   // Load from location state if user clicked "Clone / Rerun"
   useEffect(() => {
     const reuseJob = location.state?.reuseJob
-    if (reuseJob) {
+    if (reuseJob && gpuAvailable !== null) {
       setReuseJobId(reuseJob.id)
       setUrl(reuseJob.url || '')
       setUploadFilename(reuseJob.upload_filename || '')
@@ -50,7 +73,19 @@ function NewJob() {
       if (config.ratio !== undefined) setRatio(config.ratio)
       if (config.font_style !== undefined) setFontStyle(config.font_style)
       if (config.whisper_model !== undefined) setWhisperModel(config.whisper_model)
-      if (config.whisper_device !== undefined) setWhisperDevice(config.whisper_device)
+      const savedDevice = config.whisper_device || 'cpu'
+      const device = !gpuAvailable && savedDevice !== 'cpu' ? 'cpu' : savedDevice
+      setWhisperDevice(device)
+      if (config.whisper_compute_type !== undefined) {
+        setWhisperComputeType(
+          (device === 'cpu' && config.whisper_compute_type === 'float16') ||
+          (!gpuAvailable && savedDevice !== 'cpu')
+            ? 'int8'
+            : config.whisper_compute_type,
+        )
+      } else if (device === 'cpu' || device === 'auto') {
+        setWhisperComputeType('int8')
+      }
       if (config.ai_provider !== undefined) setAiProvider(config.ai_provider)
       
       if (config.use_broll !== undefined) setUseBroll(config.use_broll)
@@ -65,7 +100,7 @@ function NewJob() {
       // Default to true when cloning to save AI tokens, user can untoggle
       setLoadGeminiJson(true)
     }
-  }, [location.state])
+  }, [location.state, gpuAvailable])
 
   const handleFileUpload = async (e) => {
     const file = e.target.files?.[0]
@@ -104,13 +139,18 @@ function NewJob() {
     setSubmitting(true)
     try {
       const payload = {
-        ...(mode === 'url' ? { url: url.trim() } : { upload_filename: uploadFilename }),
+        ...(mode === 'reuse'
+          ? {}
+          : mode === 'url'
+            ? { url: url.trim() }
+            : { upload_filename: uploadFilename }),
         source,
         clips,
         ratio,
         font_style: fontStyle,
         whisper_model: whisperModel,
         whisper_device: whisperDevice,
+        whisper_compute_type: whisperComputeType,
         ai_provider: aiProvider,
         use_broll: useBroll,
         use_hook_glitch: useHookGlitch,
@@ -296,11 +336,32 @@ function NewJob() {
             </div>
             <div className="form-group">
               <label className="form-label">Device</label>
-              <select className="form-select" value={whisperDevice} onChange={(e) => setWhisperDevice(e.target.value)}>
-                <option value="cuda">CUDA (GPU)</option>
+              <select className="form-select" value={whisperDevice} onChange={(e) => {
+                const device = e.target.value
+                setWhisperDevice(device)
+                setWhisperComputeType(device === 'cpu' || device === 'auto' ? 'int8' : 'float16')
+              }}>
+                <option value="cuda" disabled={!gpuAvailable}>CUDA (GPU)</option>
                 <option value="cpu">CPU</option>
-                <option value="auto">Auto</option>
+                <option value="auto" disabled={!gpuAvailable}>Auto</option>
               </select>
+            </div>
+            <div className="form-group">
+              <label className="form-label">Whisper Compute Type</label>
+              <select
+                className="form-select"
+                value={whisperComputeType}
+                onChange={(e) => setWhisperComputeType(e.target.value)}
+              >
+                <option value="float16" disabled={whisperDevice === 'cpu'}>float16 (GPU)</option>
+                <option value="int8">int8 (Recommended for CPU)</option>
+                <option value="float32">float32</option>
+              </select>
+              <p className="form-hint">
+                {gpuAvailable
+                  ? 'CPU jobs use int8 by default; float16 requires a GPU.'
+                  : 'No usable GPU detected. CPU with int8 is selected; small is the default model to keep local transcription practical.'}
+              </p>
             </div>
           </div>
 
