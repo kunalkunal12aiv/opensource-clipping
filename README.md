@@ -148,6 +148,31 @@ The **Clipping Studio** is a browser-based dashboard hosted for free on **GitHub
 
 ---
 
+## 🌐 Run the Web Dashboard Locally
+
+With Python 3.10+, Node.js, and FFmpeg installed, create the Python environment from the repository root:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Then start the API and dashboard in separate terminals:
+
+```powershell
+# Terminal 1: start the API from the repository root
+$env:PYTHONUTF8 = "1"
+.\.venv\Scripts\python.exe -m scripts.studio_server
+
+# Terminal 2: start the dashboard
+cd web\dashboard
+npm install
+$env:VITE_API_PROXY_TARGET = "http://127.0.0.1:8000"
+npm run dev -- --host 127.0.0.1
+```
+
+Open `http://127.0.0.1:5173`. Add your Gemini API key in the dashboard's **Settings** before creating clipping jobs. The default proxy target (`http://backend:8000`) is for Docker Compose; set `VITE_API_PROXY_TARGET` when running Vite directly on your machine.
+
 ## 🚀 Local Quick Start
 
 ```bash
