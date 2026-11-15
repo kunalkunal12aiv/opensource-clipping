@@ -120,10 +120,25 @@ def run_diarization(
             "pyannote/speaker-diarization-3.1",
             token=hf_token,
         )
+    except AttributeError as exc:
+        if "'NoneType' object has no attribute 'eval'" not in str(exc):
+            raise
+        raise RuntimeError(
+            "PyAnnote could not load a required model component. Accept the "
+            "Hugging Face terms for both pyannote/speaker-diarization-3.1 and "
+            "pyannote/segmentation-3.0, then verify HF_TOKEN is authorized."
+        ) from exc
     except TypeError:
         pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
             use_auth_token=hf_token,
+        )
+
+    if pipeline is None:
+        raise RuntimeError(
+            "PyAnnote could not load speaker-diarization-3.1. Confirm that you "
+            "accepted the model terms on Hugging Face and that HF_TOKEN is valid "
+            "and authorized for this gated model."
         )
 
     # Use GPU if available

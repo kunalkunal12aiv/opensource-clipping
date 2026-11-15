@@ -39,6 +39,7 @@ _core = _load_studio_internal_module("core.py", "clipping_studio_core")
 
 format_seconds = _helpers.format_seconds
 escape_ffmpeg_filter_value = _helpers.escape_ffmpeg_filter_value
+build_subtitles_filter = _helpers.build_subtitles_filter
 detect_video_encoder = _ffmpeg_utils.detect_video_encoder
 get_ts_encode_args = _ffmpeg_utils.get_ts_encode_args
 get_mp4_encode_args = _ffmpeg_utils.get_mp4_encode_args

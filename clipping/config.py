@@ -6,6 +6,7 @@ Menyimpan semua default value dan membangun config dari CLI args.
 
 import argparse
 import hashlib
+import math
 import os
 import re
 from types import SimpleNamespace
@@ -157,7 +158,7 @@ RENDER_OUTPUT_HEIGHT = 1080
 
 # AI Provider
 AI_PROVIDER = "gemini"
-NVIDIA_MODEL = "deepseek-ai/deepseek-v4-pro"
+NVIDIA_MODEL = "deepseek-ai/deepseek-v4.1-flash"
 GEMINI_MODEL = "gemini-3-flash-preview"
 GEMINI_FALLBACK_MODEL = "gemini-2.5-flash"
 
@@ -459,7 +460,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--nvidia-model",
         default=NVIDIA_MODEL,
-        help="Model name for NVIDIA NIM API (e.g. deepseek-ai/deepseek-v3).",
+        help="Model name for NVIDIA NIM API (e.g. deepseek-ai/deepseek-v4.1-flash).",
     )
     p.add_argument("--gemini-model", default=GEMINI_MODEL, help="Gemini model name")
     p.add_argument(
@@ -659,6 +660,75 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Skip source downloads and use existing cached files.",
     )
+    story_group.add_argument(
+        "--auto-story-mode",
+        action="store_true",
+        default=False,
+        help="Create a reviewed, dialogue-only episode montage using the Auto Story-Recipe workflow.",
+    )
+    story_group.add_argument(
+        "--auto-story-output-dir",
+        default=None,
+        help="Auto Story output directory (default: outputs/auto_story_recipe/<source-id>).",
+    )
+    story_group.add_argument(
+        "--target-duration",
+        type=int,
+        default=60,
+        help="Auto Story target montage duration in seconds (60–120).",
+    )
+    story_group.add_argument(
+        "--min-beat-sec",
+        type=float,
+        default=3.5,
+        help="Minimum dialogue-beat duration in seconds (default: 3.5).",
+    )
+    story_group.add_argument(
+        "--max-beat-sec",
+        type=float,
+        default=6.0,
+        help="Maximum dialogue-beat duration in seconds (default: 6; sentence finish may add up to 0.5).",
+    )
+    story_group.add_argument(
+        "--min-gap-sec",
+        type=float,
+        default=30.0,
+        help="Minimum source-time gap between dialogue beats (default: 30).",
+    )
+    story_group.add_argument(
+        "--min-episode-span-ratio",
+        type=float,
+        default=0.4,
+        help="Required fraction of episode timeline covered by first-to-last beat (default: 0.4).",
+    )
+    story_group.add_argument(
+        "--auto-story-padding-sec",
+        type=float,
+        default=0.18,
+        help="Audio/video padding around each selected dialogue beat (default: 0.18).",
+    )
+    story_group.add_argument(
+        "--auto-story-crossfade-ms",
+        type=int,
+        default=60,
+        help="Dialogue audio/video crossfade between beats in milliseconds (50–80; default: 60).",
+    )
+    story_group.add_argument(
+        "--auto-story-whisper-model",
+        default="small",
+        help="Faster-Whisper model for Auto Story (default: small).",
+    )
+    story_group.add_argument(
+        "--auto-story-whisper-device",
+        choices=["cpu", "cuda", "auto"],
+        default="cpu",
+        help="Faster-Whisper device for Auto Story (default: cpu).",
+    )
+    story_group.add_argument(
+        "--auto-story-whisper-compute-type",
+        default="int8",
+        help="Faster-Whisper compute type for Auto Story (default: int8).",
+    )
 
     # --- Voice-Over Commentary Pipeline ---
     vo_group = p.add_argument_group("Voice-Over Commentary (TTS)")
@@ -783,9 +853,36 @@ def build_config(argv: list[str] | None = None) -> SimpleNamespace:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    # Validate: --url is required unless --story-mode is used
-    if not args.story_mode and not args.url:
-        parser.error("--url is required unless --story-mode is used.")
+    if args.story_mode and args.auto_story_mode:
+        parser.error("--story-mode and --auto-story-mode cannot be used together.")
+    if not args.story_mode and not args.auto_story_mode and not args.url:
+        parser.error("--url is required unless a story mode is used.")
+    if args.auto_story_mode:
+        if not (60 <= args.target_duration <= 120):
+            parser.error("--target-duration must be between 60 and 120 seconds.")
+        if not all(
+            math.isfinite(value)
+            for value in (
+                args.min_beat_sec,
+                args.max_beat_sec,
+                args.min_gap_sec,
+                args.min_episode_span_ratio,
+                args.auto_story_padding_sec,
+            )
+        ):
+            parser.error("Auto Story timing options must be finite numbers.")
+        if args.min_beat_sec <= 0 or args.max_beat_sec < args.min_beat_sec:
+            parser.error("--min-beat-sec and --max-beat-sec must be positive and ordered.")
+        if args.max_beat_sec > 6.0:
+            parser.error("--max-beat-sec cannot exceed 6.0; sentence completion may extend to 6.5.")
+        if args.min_gap_sec < 0:
+            parser.error("--min-gap-sec cannot be negative.")
+        if not (0 <= args.min_episode_span_ratio <= 1):
+            parser.error("--min-episode-span-ratio must be between 0 and 1.")
+        if not (0 <= args.auto_story_padding_sec <= 0.5):
+            parser.error("--auto-story-padding-sec must be between 0 and 0.5.")
+        if not (50 <= args.auto_story_crossfade_ms <= 80):
+            parser.error("--auto-story-crossfade-ms must be between 50 and 80.")
 
     # Normalize URL list for batch support
     url_list = args.url if isinstance(args.url, list) else ([args.url] if args.url else [])
@@ -947,6 +1044,22 @@ def build_config(argv: list[str] | None = None) -> SimpleNamespace:
             else os.path.join(outputs_dir, "story_clips")
         ),
         skip_download=args.skip_download,
+        auto_story_mode=args.auto_story_mode,
+        auto_story_output_dir=(
+            os.path.abspath(args.auto_story_output_dir)
+            if args.auto_story_output_dir
+            else os.path.join(outputs_dir, "auto_story_recipe")
+        ),
+        auto_story_target_duration=args.target_duration,
+        auto_story_min_beat_sec=args.min_beat_sec,
+        auto_story_max_beat_sec=args.max_beat_sec,
+        auto_story_min_gap_sec=args.min_gap_sec,
+        auto_story_min_episode_span_ratio=args.min_episode_span_ratio,
+        auto_story_padding_sec=args.auto_story_padding_sec,
+        auto_story_crossfade_ms=args.auto_story_crossfade_ms,
+        auto_story_whisper_model=args.auto_story_whisper_model,
+        auto_story_whisper_device=args.auto_story_whisper_device,
+        auto_story_whisper_compute_type=args.auto_story_whisper_compute_type,
         # Voice-Over Commentary
         voiceover=args.voiceover,
         voiceover_voice=args.voiceover_voice,

@@ -47,10 +47,15 @@
 | **Podcast Split-Screen** | Auto speaker diarization via **Pyannote** with top-bottom split-screen layout for podcasts (9:16). Supports **3+ speakers across multiple scenes** with per-speaker frozen frame fallback |
 | **Podcast Camera Switch** | Auto active-speaker detection with scene-aware switching — full 9:16 crop focuses on whoever is talking; blurred pillarbox only when speakers in the same scene talk simultaneously (9:16) |
 | **AI Voice-Over** | Converts auto-clips into original commentary/reaction videos using **Gemini** (script generation) and **edge-tts** (free text-to-speech), complete with audio ducking, text override, and ambient edge glow |
+| **Auto Story-Recipe** | Builds a reviewed dialogue montage from one episode with cached word timestamps, PyAnnote speaker IDs, two AI passes, karaoke captions, and a recipe manifest |
 
 > 🎬 **NEW: Story Clip Mode (`--story-mode`)**  
 > Need to assemble a narrative from multiple specific video sources (like a brand campaign)? We've just introduced the Multi-Source Story Clip Mode!  
 > 👉 **[Read the full Story Clip Documentation](docs/STORY_CLIP.md)**
+
+> 🎞️ **Auto Story-Recipe (`--auto-story-mode`)**
+> Select one episode storyline, review/edit its dialogue beats, then approve an editor-ready montage.
+> 👉 **[Read the Auto Story-Recipe guide](docs/AUTO_STORY_RECIPE.md)**
 
 ## 📋 Prerequisites
 
@@ -59,7 +64,7 @@
 - **CUDA GPU** recommended (for Whisper; CPU fallback available)
 - **Google Gemini API Key** ([get one here](https://aistudio.google.com/apikey))
 - **Pexels API Key** (optional, for B-roll — [get one here](https://www.pexels.com/api/))
-- **HuggingFace Token** (optional, for split-screen / camera-switch — [get one here](https://huggingface.co/settings/tokens), requires accepting [Pyannote model agreement](https://huggingface.co/pyannote/speaker-diarization-3.1))
+- **HuggingFace Token** (optional for split-screen / camera-switch; required for Auto Story-Recipe diarization — [get one here](https://huggingface.co/settings/tokens), requires accepting [Pyannote model agreement](https://huggingface.co/pyannote/speaker-diarization-3.1))
 
 ## ☁️ Running on Google Colab (Recommended)
 
@@ -150,28 +155,35 @@ The **Clipping Studio** is a browser-based dashboard hosted for free on **GitHub
 
 ## 🌐 Run the Web Dashboard Locally
 
-With Python 3.10+, Node.js, and FFmpeg installed, create the Python environment from the repository root:
+With Python 3.10+, Node.js, and FFmpeg installed, run this one-time setup from the repository root:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+npm --prefix web\dashboard install
 ```
 
-Then start the API and dashboard in separate terminals:
+### Start it each time
+
+Open **two PowerShell terminals** in the repository root and leave both running.
+
+**Terminal 1 — backend API:**
 
 ```powershell
-# Terminal 1: start the API from the repository root
 $env:PYTHONUTF8 = "1"
-.\.venv\Scripts\python.exe -m scripts.studio_server
-
-# Terminal 2: start the dashboard
-cd web\dashboard
-npm install
-$env:VITE_API_PROXY_TARGET = "http://127.0.0.1:8000"
-npm run dev -- --host 127.0.0.1
+.\.venv\Scripts\python.exe -m scripts.studio_server --host 127.0.0.1 --port 8000
 ```
 
-Open `http://127.0.0.1:5173`. Add your Gemini API key in the dashboard's **Settings** before creating clipping jobs. API keys are stored in the repository's git-ignored `.env` file; their values stay masked in the dashboard, and a **Set** label confirms a saved key. On a machine without a usable GPU, the dashboard defaults to Whisper `small` on **CPU** with `int8`, disables CUDA/Auto, and the API refuses CUDA jobs before they start. The default proxy target (`http://backend:8000`) is for Docker Compose; set `VITE_API_PROXY_TARGET` when running Vite directly on your machine.
+**Terminal 2 — web dashboard:**
+
+```powershell
+$env:VITE_API_PROXY_TARGET = "http://127.0.0.1:8000"
+npm --prefix web\dashboard run dev -- --host 127.0.0.1
+```
+
+Open `http://127.0.0.1:5173`. The dashboard uses `npm run dev` (Vite); this project does not define an `npm start` script. To create a story montage without CLI commands, choose **Auto Story** in the sidebar and follow the upload, storyline review, and render steps. See the [Auto Story-Recipe dashboard guide](docs/AUTO_STORY_RECIPE.md#use-from-the-local-studio-dashboard). Add your Gemini API key in the dashboard's **Settings** before creating clipping jobs. API keys are stored in the repository's git-ignored `.env` file; their values stay masked in the dashboard, and a **Set** label confirms a saved key. On a machine without a usable GPU, the dashboard defaults to Whisper `small` on **CPU** with `int8`, disables CUDA/Auto, and the API refuses CUDA jobs before they start. The default proxy target (`http://backend:8000`) is for Docker Compose; the dashboard command above sets the local API proxy.
+
+To run **Auto Story** on Kaggle's GPU instead of your local machine, start the Kaggle backend and use the local dashboard as its frontend; see the [Kaggle Auto Story instructions](docs/AUTO_STORY_RECIPE.md#use-the-local-auto-story-dashboard). Do not start the local API for that setup.
 
 Local setup does not require Kaggle. If the transcription backend reports an incompatible PyAV version, update the local environment with `.\.venv\Scripts\python.exe -m pip install -r requirements.txt` and restart the API; Faster-Whisper requires PyAV below 19.
 
@@ -254,8 +266,8 @@ python main.py --url "VIDEO_URL" --hook-source "DRIVE_URL_OR_PATH" --hook-source
 # Ultra-HD 2K Rendering (Fetch 1440p and render at native 1440p vertical resolution with sharpening)
 python main.py --url "VIDEO_URL" --source-height 1440 --render-height source --video-sharpen
 
-# Use NVIDIA NIM (DeepSeek-V3) instead of Gemini
-python main.py --url "VIDEO_URL" --ai-provider nvidia --nvidia-model "deepseek-ai/deepseek-v4-pro"
+# Use NVIDIA NIM (DeepSeek V4.1 Flash) instead of Gemini
+python main.py --url "VIDEO_URL" --ai-provider nvidia --nvidia-model "deepseek-ai/deepseek-v4.1-flash"
 
 # Square output for Instagram Feed (1:1)
 python main.py --url "VIDEO_URL" --ratio "1:1" --clips 5

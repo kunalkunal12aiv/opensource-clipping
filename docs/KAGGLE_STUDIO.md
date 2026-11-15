@@ -13,13 +13,27 @@ Use [`notebooks/kaggle-studio-server.ipynb`](../notebooks/kaggle-studio-server.i
 
 The first import/readiness check can take a few minutes. Stop Server requests graceful shutdown; an active native operation may delay process exit. Stopping the notebook cell also applies the supervisor's shutdown timeout and closes the managed backend and tunnel. A busy port is reported instead of connecting the notebook to an unrelated older process. API jobs are serialized even if `MAX_CONCURRENT_JOBS` requests a higher value: renderer temporary files and some settings are shared within the process. Use one Uvicorn process per checkout.
 
+## Auto Story with the Kaggle GPU
+
+The API in this notebook supports the Auto Story workflow. To use its review
+page, run the React dashboard locally and proxy its API requests to the Kaggle
+backend, following the [Auto Story Kaggle instructions](./AUTO_STORY_RECIPE.md#use-the-local-auto-story-dashboard).
+The public static Studio page does not currently include Auto Story.
+
+Auto Story chooses Faster-Whisper `small` with `float16` on CUDA when a usable
+GPU is detected, and falls back to CPU/`int8` otherwise. PyAnnote also uses
+CUDA when available. `/api/ready` checks imports and FFmpeg but does not prove
+GPU inference; if a Kaggle GPU is selected, check that the notebook runtime
+actually exposes CUDA before processing a long episode. The first run may
+still spend time downloading model weights.
+
 Tunnel requests use the full upstream address `http://127.0.0.1:8000` (or the selected port). pyngrok 9 defaults to the v3 Endpoints API, which can incorrectly expand a bare `127.0.0.1:8000` into `http://localhost:127.0.0.1:8000`. Studio selects HTTPS with the v3 `url: https://` shorthand, or the legacy `bind_tls` option for v2 configurations/older pyngrok. It accepts only an HTTPS public URL. This preserves the supported pyngrok 7.2–9.x range without forcing a dependency downgrade. The routing distinction is documented in [pyngrok's connect implementation](https://pyngrok.readthedocs.io/en/latest/_modules/pyngrok/ngrok.html); the [ngrok v3 URL reference](https://ngrok.com/docs/gateway/agent/config/v3#url) documents scheme-only URLs.
 
 ## Why the environment is isolated
 
 `numpy<2` in a requirements file is insufficient when the notebook already has native libraries loaded or incompatible preinstalled packages. The reported `numpy.dtype size changed` error occurred when importing MediaPipe during rendering, after AI analysis had succeeded.
 
-The Kaggle constraints keep NumPy 1.26.4, MediaPipe 0.10.21, OpenCV 4.11, JAX 0.4.35, and the Pyannote 3.x API on compatible dependency families. Torch 2.5.1, Torchaudio 2.5.1, and Torchvision 0.20.1 are kept together. General CLI requirements and CLI arguments are unchanged. This is a constrained environment, not a complete transitive lockfile; actual runtime import checks are still required.
+The Kaggle constraints keep NumPy 1.26.4, MediaPipe 0.10.21, OpenCV 4.11, JAX 0.4.35, and the Pyannote 3.x API on compatible dependency families. Torch 2.5.1, Torchaudio 2.5.1, and Torchvision 0.20.1 are kept together. The main requirements now use the same compatible Pyannote/Torch family; CLI arguments are unchanged. This is a constrained environment, not a complete transitive lockfile; actual runtime import checks are still required.
 
 The readiness probe checks NumPy, the MediaPipe/Studio renderer, Whisper/engine imports, and FFmpeg in a separate process. It does not download models, call paid AI APIs, validate credentials, or prove that GPU inference, gated Hugging Face models, or a particular video will succeed.
 

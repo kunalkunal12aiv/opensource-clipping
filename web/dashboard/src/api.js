@@ -25,6 +25,55 @@ export async function createJob(payload) {
   return res.json()
 }
 
+async function autoStoryRequest(path, options = {}) {
+  const res = await fetch(`${API_BASE}/auto-story${path}`, options)
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || 'Auto Story request failed')
+  }
+  return res.json()
+}
+
+export async function createAutoStory(payload) {
+  return autoStoryRequest('', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function fetchAutoStory(jobId) {
+  return autoStoryRequest(`/${encodeURIComponent(jobId)}`)
+}
+
+export async function selectAutoStoryline(jobId, storylineId) {
+  return autoStoryRequest(`/${encodeURIComponent(jobId)}/storyline`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ storyline_id: storylineId }),
+  })
+}
+
+export async function validateAutoStoryRecipe(jobId, recipe) {
+  return autoStoryRequest(`/${encodeURIComponent(jobId)}/recipe`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ recipe }),
+  })
+}
+
+export async function renderAutoStory(jobId) {
+  return autoStoryRequest(`/${encodeURIComponent(jobId)}/render`, {
+    method: 'POST',
+  })
+}
+
+export async function cancelAutoStory(jobId) {
+  return autoStoryRequest(`/${encodeURIComponent(jobId)}`, {
+    method: 'DELETE',
+  })
+}
+
 export async function deleteJob(jobId) {
   const res = await fetch(`${API_BASE}/jobs/${jobId}`, { method: 'DELETE' })
   if (!res.ok) throw new Error('Failed to delete job')

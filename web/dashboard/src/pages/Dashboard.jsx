@@ -8,6 +8,8 @@ const STATUS_LABELS = {
   transcribing: 'Transcribing',
   analyzing: 'Analyzing',
   rendering: 'Rendering',
+  awaiting_storyline: 'Choose storyline',
+  awaiting_recipe: 'Review recipe',
   completed: 'Completed',
   failed: 'Failed',
   cancelled: 'Cancelled',
@@ -59,9 +61,14 @@ function Dashboard() {
           <h2>Dashboard</h2>
           <p>Overview semua clipping jobs</p>
         </div>
-        <Link to="/new" className="btn btn-primary">
-          ➕ New Job
-        </Link>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+          <Link to="/auto-story" className="btn btn-secondary">
+            🎞️ Auto Story
+          </Link>
+          <Link to="/new" className="btn btn-primary">
+            ➕ New Job
+          </Link>
+        </div>
       </div>
 
       {/* Stats Cards */}
@@ -102,15 +109,24 @@ function Dashboard() {
           <div className="icon">🎬</div>
           <h3>Belum ada job</h3>
           <p>Buat job pertama untuk memulai clipping video otomatis dengan AI.</p>
-          <Link to="/new" className="btn btn-primary">➕ Create First Job</Link>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', justifyContent: 'center' }}>
+            <Link to="/auto-story" className="btn btn-secondary">🎞️ Create an Auto Story</Link>
+            <Link to="/new" className="btn btn-primary">➕ Create First Job</Link>
+          </div>
         </div>
       ) : (
         <div className="job-grid">
           {jobs.map(job => (
-            <Link to={`/job/${job.id}`} key={job.id} className="job-card">
+            <Link
+              to={job.config?.auto_story_mode ? `/auto-story/${job.id}` : `/job/${job.id}`}
+              key={job.id}
+              className="job-card"
+            >
               <div className="job-info">
                 <h3>
-                  {job.url ? new URL(job.url).hostname.replace('www.', '') : job.upload_filename || 'Upload'}
+                  {job.config?.auto_story_mode
+                    ? `Auto Story — ${job.auto_story?.source_name || job.upload_filename || 'Episode'}`
+                    : job.url ? new URL(job.url).hostname.replace('www.', '') : job.upload_filename || 'Upload'}
                   {job.url && <span style={{ color: 'var(--text-muted)', fontWeight: 400, marginLeft: '8px', fontSize: '12px' }}>#{job.id}</span>}
                 </h3>
                 <div className="job-meta">

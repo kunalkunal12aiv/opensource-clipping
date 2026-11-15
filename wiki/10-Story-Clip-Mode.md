@@ -1,5 +1,10 @@
 # 🎬 Story Clip Mode
 
+> Looking for an AI-guided montage from one episode with storyline selection
+> and an editable beat review? See the
+> [Auto Story-Recipe guide](https://github.com/kunalkunal12aiv/opensource-clipping/blob/main/docs/AUTO_STORY_RECIPE.md). It is a separate
+> workflow and does not change manual Story Clip recipes.
+
 Story Clip is a multi-source narrative assembly pipeline designed for campaigns (e.g., brand briefs) where you need to take specific scenes from various video sources and combine them into a cohesive story.
 
 ---

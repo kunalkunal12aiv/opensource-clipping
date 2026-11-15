@@ -8,6 +8,7 @@ import json
 import os
 import re
 import time
+from collections.abc import Callable
 
 from yt_dlp import YoutubeDL
 from faster_whisper import WhisperModel
@@ -365,6 +366,7 @@ def transcribe_video(
     device: str = "cuda",
     compute_type: str = "float16",
     whisper_model_instance=None,
+    progress_callback: Callable[[float, float], None] | None = None,
 ) -> tuple[str, list[dict]]:
     """
     Transcribe *video_path* using Faster-Whisper.
@@ -424,6 +426,8 @@ def transcribe_video(
     for segment in segments:
         # Clamp agar floating-point drift melewati durasi tidak overshoot.
         progress.update(min(segment.end, total_dur) - progress.n)
+        if progress_callback is not None:
+            progress_callback(progress.n, total_dur)
         transkrip_lengkap += f"[{segment.start:.1f} - {segment.end:.1f}] {segment.text}\n"
 
         if segment.words:
@@ -449,6 +453,8 @@ def transcribe_video(
                     chunk_words = []
 
     progress.update(total_dur - progress.n)  # snap ke 100% saat selesai
+    if progress_callback is not None:
+        progress_callback(progress.n, total_dur)
     progress.close()
     return transkrip_lengkap, data_segmen
 

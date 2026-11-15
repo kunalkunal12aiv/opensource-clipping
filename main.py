@@ -111,6 +111,27 @@ def main():
 
     version = "1.15.0"
 
+    # ── Auto Story-Recipe Mode ────────────────────────────────────────
+    if getattr(cfg, "auto_story_mode", False):
+        from clipping.auto_story import run_auto_story_pipeline
+
+        print("=" * 70)
+        print(f"🎬 OpenSource Clipping v{version} — Auto Story-Recipe Mode")
+        print("=" * 70)
+        print(f"   Sources     : {cfg.sources_json_path}")
+        print(f"   Target      : {cfg.auto_story_target_duration}s")
+        print(f"   AI Provider : {cfg.ai_provider}")
+        print(
+            f"   Whisper     : {cfg.auto_story_whisper_model} "
+            f"({cfg.auto_story_whisper_device}/{cfg.auto_story_whisper_compute_type})"
+        )
+        print(f"   Output Dir  : {cfg.auto_story_output_dir}")
+        print("   Reviews     : storyline + recipe + explicit render approval")
+        print("=" * 70)
+
+        run_auto_story_pipeline(cfg)
+        return
+
     # ── Story Clip Mode ──────────────────────────────────────────────
     if getattr(cfg, "story_mode", False):
         from clipping.story_runner import run_story_pipeline

@@ -2,6 +2,11 @@
 
 [Bahasa Indonesia](./STORY_CLIP_ID.md)
 
+> For an AI-guided, single-episode storyline montage with transcript caching and
+> manual review checkpoints, see [Auto Story-Recipe Mode](./AUTO_STORY_RECIPE.md).
+> Auto Story is a separate CLI mode; it does not change the manual recipe flow
+> described below.
+
 The **Story Clip** feature is a multi-source narrative assembly pipeline specifically designed for campaigns (such as Shopee brand briefs, etc.). This feature allows you to take specific scenes from various video sources (YouTube, TikTok, Instagram, Local, Google Drive) and combine them into a complete story automatically based on time specifications.
 
 ## Advantages

@@ -19,7 +19,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from scripts.studio_logging import configure_logging, log_event
 
-from .routes import jobs, files, settings
+from .routes import auto_story, jobs, files, settings
+from . import auto_story_worker
 from . import worker
 from .logging_middleware import RequestLoggingMiddleware
 
@@ -39,6 +40,7 @@ async def lifespan(app: FastAPI):
         log_event("api.shutdown.started", component="api", stage="shutdown")
         try:
             await worker.cancel_all_jobs()
+            await auto_story_worker.cancel_all()
         except BaseException as exc:
             log_event("api.shutdown.failed", component="api", stage="shutdown", level="ERROR", error=exc)
             raise
@@ -78,6 +80,7 @@ app.add_middleware(RequestLoggingMiddleware)
 app.include_router(jobs.router)
 app.include_router(files.router)
 app.include_router(settings.router)
+app.include_router(auto_story.router)
 
 
 @app.get("/")

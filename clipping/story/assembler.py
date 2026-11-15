@@ -10,6 +10,7 @@ Handles:
 import os
 import subprocess
 import json
+import math
 
 
 # ==============================================================================
@@ -151,6 +152,8 @@ def concat_scenes(
     scene_paths: list[str],
     output_path: str,
     transition: str = "cut",
+    fade_duration: float = 0.5,
+    scene_durations: list[float] | None = None,
 ) -> str:
     """
     Concatenate multiple scene segments into a single video.
@@ -163,7 +166,12 @@ def concat_scenes(
         Path for the concatenated output.
     transition : str
         Transition type between scenes. Currently supports:
-        ``"cut"`` (hard cut) and ``"crossfade"`` (0.5s dissolve).
+        ``"cut"`` (hard cut) and ``"crossfade"`` (dissolve).
+    fade_duration : float
+        Audio/video crossfade duration in seconds.
+    scene_durations : list[float] | None
+        Optional durations corresponding to ``scene_paths``. Used to place
+        crossfades at clip boundaries without probing each rendered segment.
         More transitions can be added later.
 
     Returns
@@ -181,7 +189,9 @@ def concat_scenes(
         return output_path
 
     if transition == "crossfade":
-        return _concat_with_crossfade(scene_paths, output_path)
+        return _concat_with_crossfade(
+            scene_paths, output_path, fade_duration, scene_durations
+        )
 
     # Default: hard cut using concat demuxer
     return _concat_hard_cut(scene_paths, output_path)
@@ -219,55 +229,102 @@ def _concat_with_crossfade(
     scene_paths: list[str],
     output_path: str,
     fade_duration: float = 0.5,
+    scene_durations: list[float] | None = None,
 ) -> str:
     """
     Concatenate with crossfade transitions between scenes using xfade filter.
     All inputs must already be normalized to the same resolution/fps.
     """
-    if len(scene_paths) == 2:
-        # Simple case: 2 inputs with 1 xfade
+    if not math.isfinite(fade_duration) or fade_duration <= 0:
+        raise ValueError("Crossfade duration must be greater than zero.")
+    if scene_durations is not None and len(scene_durations) != len(scene_paths):
+        raise ValueError("scene_durations must match the number of scene_paths.")
+    if scene_durations is None:
+        scene_durations = [
+            _probe_media_duration(path) for path in scene_paths
+        ]
+    if any(
+        not math.isfinite(duration) or duration <= fade_duration
+        for duration in scene_durations
+    ):
+        raise ValueError("Each scene must be longer than the crossfade duration.")
+
+    def make_command(
+        left_path: str,
+        right_path: str,
+        offset: float,
+        output: str,
+        label: str,
+    ) -> None:
         cmd = [
             "ffmpeg", "-y",
-            "-i", scene_paths[0],
-            "-i", scene_paths[1],
+            "-i", left_path,
+            "-i", right_path,
             "-filter_complex",
-            f"[0:v][1:v]xfade=transition=fade:duration={fade_duration}:offset=0[v];"
-            f"[0:a][1:a]acrossfade=d={fade_duration}[a]",
+            f"[0:v][1:v]xfade=transition=fade:duration={fade_duration:.3f}:"
+            f"offset={offset:.3f}[v];"
+            f"[0:a][1:a]acrossfade=d={fade_duration:.3f}[a]",
             "-map", "[v]", "-map", "[a]",
             "-c:v", "libx264", "-preset", "fast", "-crf", "18",
             "-c:a", "aac",
-            output_path,
+            output,
         ]
-        _run_ffmpeg(cmd, label="crossfade")
+        _run_ffmpeg(cmd, label=label)
+
+    if len(scene_paths) == 2:
+        # Simple case: 2 inputs with 1 xfade
+        make_command(
+            scene_paths[0],
+            scene_paths[1],
+            scene_durations[0] - fade_duration,
+            output_path,
+            "crossfade",
+        )
         return output_path
 
-    # For 3+ scenes: chain xfade filters using intermediate files
-    # (Complex filtergraph chaining gets unwieldy, so we do it iteratively)
+    # For 3+ scenes, chain each transition at the accumulated output boundary.
     import shutil
     temp_dir = output_path + "_xfade_tmp"
     os.makedirs(temp_dir, exist_ok=True)
 
-    current = scene_paths[0]
-    for i in range(1, len(scene_paths)):
-        temp_out = os.path.join(temp_dir, f"xfade_{i}.mp4")
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", current,
-            "-i", scene_paths[i],
-            "-filter_complex",
-            f"[0:v][1:v]xfade=transition=fade:duration={fade_duration}:offset=0[v];"
-            f"[0:a][1:a]acrossfade=d={fade_duration}[a]",
-            "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-            "-c:a", "aac",
-            temp_out,
-        ]
-        _run_ffmpeg(cmd, label=f"crossfade_{i}")
-        current = temp_out
+    try:
+        current = scene_paths[0]
+        current_duration = scene_durations[0]
+        for i in range(1, len(scene_paths)):
+            temp_out = os.path.join(temp_dir, f"xfade_{i}.mp4")
+            make_command(
+                current,
+                scene_paths[i],
+                current_duration - fade_duration,
+                temp_out,
+                f"crossfade_{i}",
+            )
+            current_duration += scene_durations[i] - fade_duration
+            current = temp_out
 
-    shutil.copy2(current, output_path)
-    shutil.rmtree(temp_dir, ignore_errors=True)
+        shutil.copy2(current, output_path)
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
     return output_path
+
+
+def _probe_media_duration(path: str) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", path,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    try:
+        duration = float(result.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"Unable to read media duration for {path}") from exc
+    if not math.isfinite(duration) or duration <= 0:
+        raise RuntimeError(f"Media duration must be positive for {path}")
+    return duration
 
 
 # ==============================================================================
@@ -435,6 +492,7 @@ def assemble_highlight(
     cache_dir: str,
     output_dir: str,
     ratio: str = "9:16",
+    transition_duration: float = 0.5,
 ) -> str | None:
     """
     Assemble the highlight segment for a single clip.
@@ -478,6 +536,7 @@ def assemble_highlight(
     os.makedirs(temp_dir, exist_ok=True)
 
     normalized_parts: list[str] = []
+    scene_durations: list[float] = []
 
     for idx, scene in enumerate(scenes):
         sid = scene["source_id"]
@@ -500,6 +559,8 @@ def assemble_highlight(
             print(f"      ⚠️ Scene #{idx} ({sid}): file tidak ditemukan, skip.")
             continue
 
+        duration = end - start
+
         # Trim
         trimmed = os.path.join(temp_dir, f"hl_{cid}_scene_{idx}_trim.mp4")
         trim_scene(video_path, start, end, trimmed, reencode=True)
@@ -508,8 +569,8 @@ def assemble_highlight(
         normed = os.path.join(temp_dir, f"hl_{cid}_scene_{idx}_norm.mp4")
         _normalize_scene_segment(trimmed, normed, target_w, target_h)
         normalized_parts.append(normed)
+        scene_durations.append(duration)
 
-        duration = end - start
         print(f"      ✅ Scene #{idx}: {sid} [{start:.1f}s - {end:.1f}s] ({duration:.1f}s) — {label}")
 
     if not normalized_parts:
@@ -518,7 +579,13 @@ def assemble_highlight(
 
     # Concat with transition
     output_path = os.path.join(output_dir, f"highlight_{cid}.mp4")
-    concat_scenes(normalized_parts, output_path, transition=transition_type)
+    concat_scenes(
+        normalized_parts,
+        output_path,
+        transition=transition_type,
+        fade_duration=transition_duration,
+        scene_durations=scene_durations,
+    )
 
     # Cleanup temp
     import shutil

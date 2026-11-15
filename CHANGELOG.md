@@ -7,6 +7,19 @@ All notable changes to the **OpenSource Clipping** project will be documented in
 - **Minor (x.Y.z)**: Incremented for new functionality introduced in a backward-compatible manner.
 - **Patch (x.y.Z)**: Incremented for backward-compatible bug fixes or minor patches.
 
+## [Unreleased]
+
+### Added
+- **Kaggle Auto Story GPU workflow**: Use the Auto Story dashboard against the Kaggle backend, select CUDA for Faster-Whisper when available, and document the local-dashboard-to-Kaggle tunnel setup.
+- **Auto Story-Recipe dashboard workflow**: Add a guided Studio page and staged API workflow for uploading an episode, selecting one of three discovered storylines, reviewing/editing dialogue-beat times, validating the recipe, and explicitly approving rendering. The existing CLI workflow remains available. Faster-Whisper word timestamps, PyAnnote speaker turns, and Gemini/NVIDIA pass results remain cached.
+- **Auto Story transcription progress and resilience**: Reflect Faster-Whisper audio progress in the dashboard and continue when an isolated word has a zero-length timestamp, with a terminal warning; invalid or reversed timestamps still fail explicitly.
+- **PyAnnote/torchaudio compatibility**: Pin the tested PyAnnote 3.3.2 and matched PyTorch/Torchaudio 2.5.1 stack so speaker diarization retains the `AudioMetaData` API without moving MediaPipe to NumPy 2.
+- **Story montage validation and outputs**: Validate word-boundary timing, 3.5–6 second beats (up to 6.5 seconds only to finish punctuated speech), source-time gaps, episode span, and target runtime. Render with a mode-specific short crossfade, rebase karaoke captions, and write an MP4, ASS sidecar, and human-readable recipe manifest. Existing manual Story Clip mode remains separate.
+- **Auto Story documentation and offline tests**: Document setup, Hugging Face model access, CLI options, caching, review flow, and v1 limitations. Regression tests mock transcription and diarization; tests do not call paid AI providers.
+
+### Fixed
+- **NVIDIA Auto Story model default**: Use `deepseek-ai/deepseek-v4.1-flash`, which is listed in NVIDIA's current hosted model catalog, instead of the unavailable `deepseek-ai/deepseek-v4-pro` identifier that returned HTTP 410.
+
 
 ## [v1.15.7]
 

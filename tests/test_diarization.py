@@ -1,8 +1,39 @@
 """The shared CLI/API audio extractor must never unlink its source."""
 
+import sys
+import types
+
 import pytest
 
 from clipping import diarization
+
+
+def test_missing_gated_model_access_reports_actionable_error(monkeypatch):
+    class Pipeline:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            return None
+
+    pyannote_audio = types.ModuleType("pyannote.audio")
+    pyannote_audio.Pipeline = Pipeline
+    monkeypatch.setitem(sys.modules, "pyannote.audio", pyannote_audio)
+
+    with pytest.raises(RuntimeError, match="accepted the model terms"):
+        diarization.run_diarization("audio.wav", "hf-token")
+
+
+def test_missing_segmentation_access_reports_both_gated_models(monkeypatch):
+    class Pipeline:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            raise AttributeError("'NoneType' object has no attribute 'eval'")
+
+    pyannote_audio = types.ModuleType("pyannote.audio")
+    pyannote_audio.Pipeline = Pipeline
+    monkeypatch.setitem(sys.modules, "pyannote.audio", pyannote_audio)
+
+    with pytest.raises(RuntimeError, match="pyannote/segmentation-3.0"):
+        diarization.run_diarization("audio.wav", "hf-token")
 
 
 def test_same_path_is_rejected_before_touching_video(tmp_path, monkeypatch):

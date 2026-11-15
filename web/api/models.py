@@ -21,6 +21,8 @@ class JobStatus(str, enum.Enum):
     TRANSCRIBING = "transcribing"
     ANALYZING = "analyzing"
     RENDERING = "rendering"
+    AWAITING_STORYLINE = "awaiting_storyline"
+    AWAITING_RECIPE = "awaiting_recipe"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -31,6 +33,7 @@ class SourcePlatform(str, enum.Enum):
     TIKTOK = "tiktok"
     INSTAGRAM = "instagram"
     GDRIVE = "gdrive"
+    LOCAL = "local"
 
 
 class AspectRatio(str, enum.Enum):
@@ -149,6 +152,30 @@ class JobCreateRequest(BaseModel):
         return value
 
 
+class AutoStoryCreateRequest(BaseModel):
+    """Create a dashboard-guided Auto Story workflow from an uploaded episode."""
+
+    upload_filename: str = Field(..., description="Filename returned by /api/upload")
+    source_name: str = Field("Episode", min_length=1, max_length=180)
+    target_duration_sec: int = Field(60, ge=60, le=120)
+    ai_provider: AIProvider = AIProvider.GEMINI
+
+    @field_validator("upload_filename")
+    @classmethod
+    def validate_upload_filename(cls, value: str) -> str:
+        if not value or value in {".", ".."} or any(ch in value for ch in '/\\:\x00'):
+            raise ValueError("upload_filename must be a filename, not a path")
+        return value
+
+
+class AutoStorylineSelectionRequest(BaseModel):
+    storyline_id: str = Field(..., min_length=1, max_length=80)
+
+
+class AutoStoryRecipeRequest(BaseModel):
+    recipe: dict
+
+
 # ---------------------------------------------------------------------------
 # Job Progress Event
 # ---------------------------------------------------------------------------
@@ -201,6 +228,7 @@ class JobResponse(BaseModel):
     error: Optional[str] = None
     cancel_requested: bool = False
     log: list[str] = Field(default_factory=list)
+    auto_story: Optional[dict] = None
 
 
 class JobListResponse(BaseModel):

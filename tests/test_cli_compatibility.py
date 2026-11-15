@@ -16,7 +16,10 @@ def test_cli_help_does_not_require_fastapi_or_gpu(tmp_path):
         capture_output=True, text=True, encoding="utf-8", timeout=15,
     )
     assert result.returncode == 0, result.stderr
-    for flag in ("--url", "--yt-cookies", "--load-gemini-json", "--ai-provider", "--story-mode"):
+    for flag in (
+        "--url", "--yt-cookies", "--load-gemini-json", "--ai-provider",
+        "--story-mode", "--auto-story-mode", "--target-duration",
+    ):
         assert flag in result.stdout
     assert not (tmp_path / "outputs").exists()
 
@@ -46,6 +49,7 @@ def test_cli_story_mode_still_accepts_no_url(monkeypatch, tmp_path):
     cfg = config.build_config(["--story-mode"])
     assert cfg.story_mode is True
     assert cfg.url_list == []
+    assert cfg.nvidia_model == "deepseek-ai/deepseek-v4.1-flash"
 
 
 def test_cli_and_studio_use_compatible_model_without_reusing_legacy_cache(monkeypatch, tmp_path):

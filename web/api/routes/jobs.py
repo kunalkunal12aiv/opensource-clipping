@@ -60,6 +60,7 @@ def _job_to_response(job: dict) -> JobResponse:
         error=job.get("error"),
         cancel_requested=job.get("cancel_requested", False),
         log=job.get("log", []),
+        auto_story=job.get("auto_story"),
     )
 
 
@@ -168,6 +169,15 @@ async def delete_job(job_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Job not found")
 
     if job.get("status") not in store.TERMINAL_STATES:
+        if job.get("config", {}).get("auto_story_mode"):
+            from .. import auto_story_worker
+
+            if not auto_story_worker.cancel(job_id):
+                raise HTTPException(status_code=409, detail="Auto Story job is already finished.")
+            return {
+                "message": "Cancellation requested; waiting for the current model operation to finish.",
+                "id": job_id, "cancel_requested": True,
+            }
         worker.cancel_job(job_id)
         return {
             "message": "Cancellation requested; waiting for the current operation to finish.",

@@ -3,6 +3,7 @@ import Dashboard from './pages/Dashboard'
 import NewJob from './pages/NewJob'
 import JobDetail from './pages/JobDetail'
 import Settings from './pages/Settings'
+import AutoStory from './pages/AutoStory'
 
 function App() {
   const location = useLocation()
@@ -24,6 +25,10 @@ function App() {
             <span className="icon">➕</span>
             New Job
           </NavLink>
+          <NavLink to="/auto-story" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
+            <span className="icon">🎞️</span>
+            Auto Story
+          </NavLink>
           <NavLink to="/settings" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
             <span className="icon">⚙️</span>
             Settings
@@ -41,6 +46,8 @@ function App() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/new" element={<NewJob />} />
+          <Route path="/auto-story" element={<AutoStory />} />
+          <Route path="/auto-story/:jobId" element={<AutoStory />} />
           <Route path="/job/:jobId" element={<JobDetail />} />
           <Route path="/settings" element={<Settings />} />
         </Routes>

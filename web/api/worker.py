@@ -50,6 +50,27 @@ def get_settings_env() -> dict[str, str]:
     return dict(_settings_env)
 
 
+def _run_with_job_context(job_id: str, function, args: tuple):
+    token = job_context.set(job_id)
+    try:
+        return function(*args)
+    finally:
+        job_context.reset(token)
+
+
+async def run_serialized_call(job_id: str, function, *args):
+    """Run one synchronous operation without overlapping other renderer jobs."""
+    async with _semaphore:
+        _running_jobs.add(job_id)
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                _executor, _run_with_job_context, job_id, function, args
+            )
+        finally:
+            _running_jobs.discard(job_id)
+
+
 class JobCancelled(Exception):
     """Internal signal raised at safe pipeline boundaries."""
 

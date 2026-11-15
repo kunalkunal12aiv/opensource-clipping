@@ -250,6 +250,23 @@ def build_config_from_payload(
         sources_json_path=None,
         story_output_dir=None,
         skip_download=False,
+        # Auto Story-Recipe
+        auto_story_mode=payload.get("auto_story_mode", False),
+        auto_story_output_dir=outputs_dir,
+        auto_story_target_duration=payload.get("target_duration_sec", 60),
+        auto_story_min_beat_sec=payload.get("min_beat_sec", 3.5),
+        auto_story_max_beat_sec=payload.get("max_beat_sec", 6.0),
+        auto_story_min_gap_sec=payload.get("min_gap_sec", 30.0),
+        auto_story_min_episode_span_ratio=payload.get(
+            "min_episode_span_ratio", 0.4
+        ),
+        auto_story_padding_sec=payload.get("padding_sec", 0.18),
+        auto_story_crossfade_ms=payload.get("crossfade_ms", 60),
+        auto_story_whisper_model=payload.get("auto_story_whisper_model", "small"),
+        auto_story_whisper_device=payload.get("auto_story_whisper_device", "cpu"),
+        auto_story_whisper_compute_type=payload.get(
+            "auto_story_whisper_compute_type", "int8"
+        ),
     )
 
     return cfg

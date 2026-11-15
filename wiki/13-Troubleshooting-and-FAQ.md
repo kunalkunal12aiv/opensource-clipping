@@ -64,14 +64,30 @@ pip install --upgrade pyannote.audio
 
 ---
 
+### 🔴 `torchaudio` has no attribute `AudioMetaData`
+
+**Error:** PyAnnote stops while importing with `AttributeError: module 'torchaudio' has no attribute 'AudioMetaData'`.
+
+**Cause:** Older `pyannote.audio` releases use audio metadata APIs removed from newer `torchaudio` versions.
+
+**Fix:** From the repository root, update the project environment to the supported PyAnnote version, then restart the backend:
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+---
+
 ### 🔴 HuggingFace Token Error (Podcast Modes)
 
-**Error:** `401 Unauthorized` when using `--split-screen` or `--camera-switch`
+**Error:** PyAnnote cannot download `pyannote/speaker-diarization-3.1` or `pyannote/segmentation-3.0`, or returns `401 Unauthorized` / `NoneType` has no attribute `eval`.
+
+**Cause:** Both models are gated. A token being present is not enough; the Hugging Face account must have accepted the terms for both repositories, and the token must belong to that account and be authorized to read them.
 
 **Fix:**
 1. Create a token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
-2. Accept the [Pyannote model agreement](https://huggingface.co/pyannote/speaker-diarization-3.1)
-3. Add to `.env`: `HF_TOKEN=hf_your-token`
+2. Accept the terms for [speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) and [segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
+3. In the dashboard's **Settings**, enter the token in **HuggingFace Token** and save it. Alternatively, set `HF_TOKEN=hf_your-token` in the repository's git-ignored `.env`.
+4. Start a new Auto Story job. The failed job cannot resume from the diarization step.
 
 **Alternative:** Use `--split-trigger face` which doesn't require a token:
 ```bash
