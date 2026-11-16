@@ -785,3 +785,10 @@ Dukung proyek ini melalui Saweria: [https://saweria.co/NaufalRizqullah17](https:
 ## 📄 Lisensi
 
 Open source. Bebas digunakan, dimodifikasi, dan didistribusikan.
+
+
+
+
+
+$env:VITE_API_PROXY_TARGET = "https://<fresh-ngrok-url>"
+npm --prefix web\dashboard run dev -- --host 127.0.0.1

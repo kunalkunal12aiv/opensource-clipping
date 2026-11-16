@@ -75,10 +75,12 @@ Open `http://127.0.0.1:5173`, select **Auto Story** in the sidebar, and:
    uncheck any you do not want. Choose **Rerun story discovery** for a fresh set,
    or **Create & render** to build the selected stories.
 5. After selection, the backend automatically creates, validates, and renders
-   each story. It retries beat-candidate generation up to three times when a
-   candidate pool cannot meet the timing, spacing, span, or runtime constraints.
-   The results include a separate MP4, caption sidecar, and manifest for each
-   story, plus a combined plan manifest.
+   each story. It retries beat-candidate generation with progressively broader
+   candidates and a final, recorded 15-second pacing fallback. If an individual
+   storyline still cannot be scheduled, it skips that arc and continues with the
+   others; successful renders are not discarded. The results include a separate
+   MP4, caption sidecar, and manifest for each rendered story, plus a combined
+   plan manifest that records skipped storylines.
 
 The page can be refreshed during processing or story selection; the dashboard job state
 and cached transcript remain on the local backend. Auto Story uses the existing
@@ -165,20 +167,24 @@ The CLI continues to write one `story_montage.mp4`, one ASS sidecar, and one
   terminal warning; invalid or reversed timestamps still stop the workflow.
 - Each cut has 180 ms padding by default, with a 60 ms audio/video crossfade
   between cuts. Crossfade is configurable from 50–80 ms.
-- Consecutive beats must be at least 30 source seconds apart and total output
-  must be within 10% of the target duration. The CLI's first-to-last span must
+- Consecutive beats normally target at least 30 source seconds apart; the Studio
+  retries the final candidate pool with a 15-second gap and half the arc's
+  minimum source-span ratio if strict scheduling fails. The actual settings are
+  recorded in each story manifest. Total output must be within 10% of the target
+  duration. The CLI's first-to-last span must
   cover at least 40% of the episode. For a dashboard story whose arc covers a
   shorter source span, the same ratio is applied to that arc's span. These
   checks are configurable with `--min-gap-sec` and
   `--min-episode-span-ratio`.
 - Scene-boundary detection, active-speaker cropping, Demucs, and TTS are not
-  part of v1. The Studio retries beat-candidate generation up to three times;
-  if the selected story still cannot satisfy the constraints, the job reports
-  the failed story instead of rendering an invalid montage.
+  part of v1. If a selected story still cannot be scheduled after the automatic
+  fallback, the Studio records it as skipped and continues rendering the other
+  selected stories. The job fails only when none of the selected stories can be
+  scheduled or rendering cannot produce any usable output.
 
 The CLI's two AI passes call only the provider chosen with `--ai-provider`.
-The Studio makes one storyline-discovery request and one or more beat-planning
-requests per selected story (up to three candidate rounds). Rerunning discovery
+The Studio makes one storyline-discovery request and up to three beat-planning
+requests per selected story. Rerunning discovery
 makes a fresh discovery request. Results are cached by transcript, prompt
 version, model, selected storyline, candidate round, and recipe settings. Tests
 mock transcription, diarization, rendering, and AI; running the test suite does

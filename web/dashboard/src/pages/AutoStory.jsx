@@ -17,6 +17,15 @@ import {
 
 const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled']
 
+function getDefaultStorylineSelection(autoStory) {
+  const failedIds = new Set(
+    (autoStory?.failed_stories || []).map(story => story.storyline_id),
+  )
+  return (autoStory?.storylines || [])
+    .filter(storyline => !failedIds.has(storyline.id))
+    .map(storyline => storyline.id)
+}
+
 function AutoStory() {
   const { jobId } = useParams()
   const navigate = useNavigate()
@@ -79,16 +88,12 @@ function AutoStory() {
         ) {
           displayedDiscoveryRevision.current = currentDiscoveryRevision
           selectionTouched.current = false
-          setSelectedStorylineIds(
-            (data.auto_story.storylines || []).map(storyline => storyline.id),
-          )
+          setSelectedStorylineIds(getDefaultStorylineSelection(data.auto_story))
         } else if (
           data.status === 'awaiting_storyline'
           && !selectionTouched.current
         ) {
-          setSelectedStorylineIds(
-            (data.auto_story.storylines || []).map(storyline => storyline.id),
-          )
+          setSelectedStorylineIds(getDefaultStorylineSelection(data.auto_story))
         }
         if (data.auto_story?.stories?.length && !planTouched.current) {
           setStories(data.auto_story.stories)
@@ -639,6 +644,19 @@ function AutoStory() {
             Select one or more storylines. All are selected initially; uncheck any you do not want.
             After you continue, the backend automatically creates and renders the selected stories.
           </p>
+          {state.failed_stories?.length > 0 && (
+            <div className="auto-story-warning" role="status">
+              <strong>Some storylines failed automatic scheduling.</strong>
+              <p>They are unchecked below. Choose different arcs or rerun discovery; any successful outputs are kept.</p>
+              <ul>
+                {state.failed_stories.map(story => (
+                  <li key={story.storyline_id}>
+                    <strong>{story.title}:</strong> {story.reason}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           <div className="auto-story-storylines">
             {state.storylines?.map((storyline, index) => (
               <article className="card auto-story-storyline" key={storyline.id}>
@@ -900,6 +918,24 @@ function AutoStory() {
       {job.status === 'completed' && (
         <section className="auto-story-section">
           <h3>Your stories are ready</h3>
+          {state.failed_stories?.length > 0 && (
+            <div className="auto-story-warning" role="status">
+              <strong>
+                Rendered {state.stories?.length || 0} of {state.selected_story_count || state.selected_storyline_ids?.length || 0} selected stories.
+              </strong>
+              <p>
+                These storylines could not meet the timing and pacing checks, so they were skipped.
+                Your successful renders are still available below.
+              </p>
+              <ul>
+                {state.failed_stories.map(story => (
+                  <li key={story.storyline_id}>
+                    <strong>{story.title}:</strong> {story.reason}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           {state.stories?.length ? state.stories.map((story, index) => (
             <article className="card auto-story-storyline auto-story-result" key={story.story_id}>
               <span className="auto-story-kicker">Story {index + 1} of {state.stories.length}</span>
@@ -940,6 +976,19 @@ function AutoStory() {
 
       {job.status === 'failed' && (
         <section className="auto-story-section">
+          {state.failed_stories?.length > 0 && (
+            <div className="auto-story-warning">
+              <h3>Could not schedule the selected stories</h3>
+              <p>The automatic pacing fallbacks were exhausted. Try rerunning discovery for a different set of storylines.</p>
+              <ul>
+                {state.failed_stories.map(story => (
+                  <li key={story.storyline_id}>
+                    <strong>{story.title}:</strong> {story.reason}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           {state.output_files?.length > 0 && (
             <div className="card auto-story-storyline auto-story-result">
               <h3>Some stories rendered before the failure</h3>

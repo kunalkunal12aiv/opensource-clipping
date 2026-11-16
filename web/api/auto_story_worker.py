@@ -280,20 +280,24 @@ def _create_story_plan(
     cfg = context["cfg"]
     words = _load_words(state)
     crossfade_sec = cfg.auto_story_crossfade_ms / 1000
-    story_span_ratio = _story_span_ratio(
-        cfg, arc, state["source_duration_sec"]
+    story_span_ratio = _story_span_ratio(cfg, arc, state["source_duration_sec"])
+    configured_gap = cfg.auto_story_min_gap_sec
+    schedules = (
+        (configured_gap, story_span_ratio),
+        (configured_gap, story_span_ratio),
+        (min(configured_gap, max(5.0, configured_gap * 0.5)), story_span_ratio * 0.5),
     )
-    settings = {
-        "target_duration_sec": cfg.auto_story_target_duration,
-        "min_beat_sec": cfg.auto_story_min_beat_sec,
-        "max_beat_sec": cfg.auto_story_max_beat_sec,
-        "min_gap_sec": cfg.auto_story_min_gap_sec,
-        "min_episode_span_ratio": story_span_ratio,
-        "padding_sec": cfg.auto_story_padding_sec,
-        "crossfade_sec": crossfade_sec,
-    }
     last_error = None
-    for candidate_round in range(3):
+    for candidate_round, (min_gap, min_span_ratio) in enumerate(schedules):
+        settings = {
+            "target_duration_sec": cfg.auto_story_target_duration,
+            "min_beat_sec": cfg.auto_story_min_beat_sec,
+            "max_beat_sec": cfg.auto_story_max_beat_sec,
+            "min_gap_sec": min_gap,
+            "min_episode_span_ratio": min_span_ratio,
+            "padding_sec": cfg.auto_story_padding_sec,
+            "crossfade_sec": crossfade_sec,
+        }
         try:
             response, cache_key = pipeline._select_beats(
                 arc,
@@ -301,8 +305,8 @@ def _create_story_plan(
                 cfg.auto_story_target_duration,
                 cfg.auto_story_min_beat_sec,
                 cfg.auto_story_max_beat_sec,
-                cfg.auto_story_min_gap_sec,
-                story_span_ratio,
+                min_gap,
+                min_span_ratio,
                 state["source_duration_sec"],
                 cfg.auto_story_padding_sec,
                 crossfade_sec,
@@ -342,6 +346,7 @@ def _create_story_plan(
                 "story_id": story_id,
                 "storyline": arc,
                 "recipe": recipe,
+                "settings": settings,
                 "timing_options": pipeline._build_review_timing_options(
                     recipe, arc, words
                 ),
@@ -355,8 +360,9 @@ def _create_story_plan(
         except ValueError as exc:
             last_error = exc
     raise ValueError(
-        f"Could not build story {arc['title']!r} after three different "
-        f"dialogue-candidate attempts: {last_error}"
+        f"Could not schedule story {arc['title']!r} after three candidate "
+        f"attempts, including a {schedules[-1][0]:.1f}-second pacing fallback: "
+        f"{last_error}"
     ) from last_error
 
 
@@ -404,6 +410,7 @@ def _create_selected_stories_sync(
         raise ValueError("Selected storylines must be unique.")
 
     stories = []
+    failed_stories = []
     for index, storyline_id in enumerate(storyline_ids, 1):
         _check_cancelled(job_id)
         arc = by_id[storyline_id]
@@ -415,17 +422,39 @@ def _create_selected_stories_sync(
             f"Creating story {index} of {len(storyline_ids)}: {arc['title']}.",
             60 + (20 * (index - 1) / len(storyline_ids)),
         )
-        story = _create_story_plan(
-            state,
-            context,
-            arc,
-            f"story-{index}",
-        )
+        try:
+            story = _create_story_plan(
+                state,
+                context,
+                arc,
+                f"story-{len(stories) + 1}",
+            )
+        except ValueError as exc:
+            failed_stories.append({
+                "storyline_id": storyline_id,
+                "title": arc["title"],
+                "reason": str(exc),
+            })
+            state = _update_state(
+                job_id,
+                selected_storyline_ids=storyline_ids,
+                selected_story_count=len(storyline_ids),
+                stories=list(stories),
+                failed_stories=list(failed_stories),
+                phase="planning",
+                message=(
+                    f"Story {index} could not be scheduled. Continuing with "
+                    f"the other {len(storyline_ids) - index} selected stories."
+                ),
+            )
+            continue
         stories.append(story)
         state = _update_state(
             job_id,
             selected_storyline_ids=storyline_ids,
+            selected_story_count=len(storyline_ids),
             stories=list(stories),
+            failed_stories=list(failed_stories),
             story_count=len(storylines),
             validation=_aggregate_story_validation(stories),
             output_files=[],
@@ -438,13 +467,29 @@ def _create_selected_stories_sync(
         )
 
     _check_cancelled(job_id)
+    if not stories:
+        failures = "; ".join(
+            f"{item['title']}: {item['reason']}" for item in failed_stories
+        )
+        raise ValueError(
+            f"None of the {len(storyline_ids)} selected stories could be "
+            f"scheduled. {failures}"
+        )
     state = _update_state(
         job_id,
         stories=stories,
+        failed_stories=failed_stories,
+        selected_story_count=len(storyline_ids),
         story_count=len(storylines),
         validation=_aggregate_story_validation(stories),
         phase="rendering",
-        message=f"Rendering {len(stories)} selected stories.",
+        message=(
+            f"Rendering {len(stories)} stories"
+            + (
+                f"; skipping {len(failed_stories)} unbuildable storyline(s)."
+                if failed_stories else "."
+            )
+        ),
     )
     return _render_stories_sync(job_id, _job(job_id), state)
 
@@ -634,9 +679,12 @@ def _validate_stories_sync(job_id: str, submitted_stories: list[dict]) -> dict:
                 cfg.auto_story_target_duration,
                 cfg.auto_story_min_beat_sec,
                 cfg.auto_story_max_beat_sec,
-                cfg.auto_story_min_gap_sec,
-                _story_span_ratio(
-                    cfg, arc, state["source_duration_sec"]
+                planned.get("settings", {}).get(
+                    "min_gap_sec", cfg.auto_story_min_gap_sec
+                ),
+                planned.get("settings", {}).get(
+                    "min_episode_span_ratio",
+                    _story_span_ratio(cfg, arc, state["source_duration_sec"]),
                 ),
                 cfg.auto_story_padding_sec,
                 cfg.auto_story_crossfade_ms / 1000,
@@ -734,6 +782,101 @@ def _reconstruct_story_sync(
     }
 
 
+def _render_story_sync(
+    job_id: str,
+    story: dict,
+    story_index: int,
+    story_count: int,
+    state: dict,
+    context: dict,
+    cfg,
+    words: list[dict],
+) -> tuple[dict, list[dict]]:
+    arc = story["storyline"]
+    recipe = story.get("recipe")
+    if not isinstance(recipe, dict):
+        raise ValueError(f"Story {story_index} ({arc['title']}) is missing its recipe.")
+    settings = story.get("settings") or {}
+    validated = pipeline.validate_review_recipe(
+        recipe,
+        arc,
+        words,
+        state["source_id"],
+        state["source_duration_sec"],
+        cfg.auto_story_target_duration,
+        cfg.auto_story_min_beat_sec,
+        cfg.auto_story_max_beat_sec,
+        settings.get("min_gap_sec", cfg.auto_story_min_gap_sec),
+        settings.get(
+            "min_episode_span_ratio",
+            _story_span_ratio(cfg, arc, state["source_duration_sec"]),
+        ),
+        cfg.auto_story_padding_sec,
+        cfg.auto_story_crossfade_ms / 1000,
+    )
+    _set_progress(
+        job_id,
+        JobStatus.RENDERING,
+        "render",
+        4,
+        f"Rendering story {story_index} of {story_count}: {arc['title']}.",
+        85 + (14 * (story_index - 1) / story_count),
+    )
+    title_slug = pipeline._safe_source_name(arc["title"]).lower()
+    output_prefix = f"{story['story_id']}_{title_slug}"
+    video_path, captions_path, actual_runtime = pipeline._render_montage(
+        validated,
+        words,
+        context["source_registry"],
+        context["cache_dir"],
+        context["output_dir"],
+        cfg,
+        output_prefix=output_prefix,
+    )
+    manifest_path = os.path.join(
+        context["output_dir"], f"{output_prefix}_manifest.json"
+    )
+    manifest = {
+        "schema_version": 1,
+        "story_id": story["story_id"],
+        "source_id": state["source_id"],
+        "source_name": state["source_name"],
+        "storyline": validated["storyline"],
+        "target_duration_sec": validated["target_duration_sec"],
+        "estimated_runtime_sec": validated["estimated_runtime_sec"],
+        "actual_runtime_sec": actual_runtime,
+        "settings": validated["settings"],
+        "video_file": os.path.basename(video_path),
+        "captions_file": os.path.basename(captions_path),
+        "recipe_file": story["recipe_filename"],
+        "beats": validated["beats"],
+    }
+    pipeline._write_json(manifest_path, manifest)
+    filenames = [
+        os.path.basename(video_path),
+        os.path.basename(captions_path),
+        os.path.basename(manifest_path),
+        story["recipe_filename"],
+    ]
+    files = [
+        {
+            "filename": filename,
+            "download_url": (
+                f"/api/outputs/{quote(job_id, safe='')}/"
+                f"{quote(filename, safe='')}"
+            ),
+        }
+        for filename in filenames
+    ]
+    return {
+        **story,
+        "manifest": manifest,
+        "manifest_file": os.path.basename(manifest_path),
+        "actual_runtime_sec": actual_runtime,
+        "output_files": files,
+    }, files
+
+
 def _render_stories_sync(job_id: str, job: dict, state: dict) -> dict:
     context = _source_context(job)
     cfg = context["cfg"]
@@ -745,6 +888,7 @@ def _render_stories_sync(job_id: str, job: dict, state: dict) -> dict:
     words = _load_words(state)
     rendered_stories = []
     output_files = []
+    failed_stories = list(state.get("failed_stories", []))
     count = len(stories)
 
     def output_file(filename: str) -> dict:
@@ -758,79 +902,47 @@ def _render_stories_sync(job_id: str, job: dict, state: dict) -> dict:
 
     for index, story in enumerate(stories, 1):
         _check_cancelled(job_id)
-        arc = story["storyline"]
-        recipe = story.get("recipe")
-        if not isinstance(recipe, dict):
-            raise ValueError(f"Story {index} ({arc['title']}) is missing its recipe.")
-        validated = pipeline.validate_review_recipe(
-            recipe,
-            arc,
-            words,
-            state["source_id"],
-            state["source_duration_sec"],
-            cfg.auto_story_target_duration,
-            cfg.auto_story_min_beat_sec,
-            cfg.auto_story_max_beat_sec,
-            cfg.auto_story_min_gap_sec,
-            _story_span_ratio(
-                cfg, arc, state["source_duration_sec"]
-            ),
-            cfg.auto_story_padding_sec,
-            cfg.auto_story_crossfade_ms / 1000,
-        )
-        _set_progress(
-            job_id,
-            JobStatus.RENDERING,
-            "render",
-            4,
-            f"Rendering story {index} of {count}: {arc['title']}.",
-            85 + (14 * (index - 1) / count),
-        )
-        title_slug = pipeline._safe_source_name(arc["title"]).lower()
-        output_prefix = f"{story['story_id']}_{title_slug}"
-        video_path, captions_path, actual_runtime = pipeline._render_montage(
-            validated,
-            words,
-            context["source_registry"],
-            context["cache_dir"],
-            context["output_dir"],
-            cfg,
-            output_prefix=output_prefix,
-        )
-        manifest_path = os.path.join(
-            context["output_dir"], f"{output_prefix}_manifest.json"
-        )
-        manifest = {
-            "schema_version": 1,
-            "story_id": story["story_id"],
-            "source_id": state["source_id"],
-            "source_name": state["source_name"],
-            "storyline": validated["storyline"],
-            "target_duration_sec": validated["target_duration_sec"],
-            "estimated_runtime_sec": validated["estimated_runtime_sec"],
-            "actual_runtime_sec": actual_runtime,
-            "settings": validated["settings"],
-            "video_file": os.path.basename(video_path),
-            "captions_file": os.path.basename(captions_path),
-            "recipe_file": story["recipe_filename"],
-            "beats": validated["beats"],
-        }
-        pipeline._write_json(manifest_path, manifest)
-        filenames = [
-            os.path.basename(video_path),
-            os.path.basename(captions_path),
-            os.path.basename(manifest_path),
-            story["recipe_filename"],
-        ]
-        files = [output_file(filename) for filename in filenames]
+        try:
+            rendered_story, files = _render_story_sync(
+                job_id,
+                story,
+                index,
+                count,
+                state,
+                context,
+                cfg,
+                words,
+            )
+        except worker.JobCancelled:
+            raise
+        except Exception as exc:
+            arc = story["storyline"]
+            failed_stories.append({
+                "storyline_id": arc.get("id", story["story_id"]),
+                "title": arc["title"],
+                "reason": f"Rendering failed: {type(exc).__name__}: {exc}",
+            })
+            log_event(
+                "auto_story_story_render_failed",
+                component="auto_story",
+                job_id=job_id,
+                level="ERROR",
+                error=exc,
+            )
+            _update_state(
+                job_id,
+                stories=[*rendered_stories, *stories[index:]],
+                failed_stories=list(failed_stories),
+                output_files=list(output_files),
+                rendered_story_count=len(rendered_stories),
+                phase="rendering",
+                message=(
+                    f"Story {index} failed to render. Continuing with the "
+                    f"other {count - index} planned stories."
+                ),
+            )
+            continue
         output_files.extend(files)
-        rendered_story = {
-            **story,
-            "manifest": manifest,
-            "manifest_file": os.path.basename(manifest_path),
-            "actual_runtime_sec": actual_runtime,
-            "output_files": files,
-        }
         rendered_stories.append(rendered_story)
         _update_state(
             job_id,
@@ -838,6 +950,7 @@ def _render_stories_sync(job_id: str, job: dict, state: dict) -> dict:
                 *rendered_stories,
                 *stories[index:],
             ],
+            failed_stories=list(failed_stories),
             output_files=list(output_files),
             rendered_story_count=len(rendered_stories),
             phase="rendering",
@@ -846,11 +959,21 @@ def _render_stories_sync(job_id: str, job: dict, state: dict) -> dict:
             ),
         )
 
+    if not rendered_stories:
+        failures = "; ".join(
+            f"{item['title']}: {item['reason']}" for item in failed_stories
+        )
+        raise ValueError(f"No selected stories could be rendered. {failures}")
+
     plan_manifest = {
         "schema_version": 1,
         "source_id": state["source_id"],
         "source_name": state["source_name"],
-        "story_count": count,
+        "story_count": len(rendered_stories),
+        "selected_story_count": state.get(
+            "selected_story_count", len(state.get("selected_storyline_ids", stories))
+        ),
+        "failed_stories": failed_stories,
         "target_duration_sec_per_story": cfg.auto_story_target_duration,
         "stories": [
             {
@@ -873,6 +996,7 @@ def _render_stories_sync(job_id: str, job: dict, state: dict) -> dict:
     output_files.append(output_file(os.path.basename(plan_manifest_path)))
     return {
         "stories": rendered_stories,
+        "failed_stories": failed_stories,
         "output_files": output_files,
         "manifest": plan_manifest,
     }
@@ -1013,6 +1137,15 @@ async def _run_stage(job_id: str, stage: str, function, *args) -> None:
             )
         elif stage == "generation":
             state = _update_state(job_id, **result, phase="completed")
+            skipped_count = len(state.get("failed_stories", []))
+            rendered_count = len(state.get("stories", []))
+            completion_message = (
+                f"Rendered {rendered_count} selected stories; "
+                f"{skipped_count} unbuildable storyline(s) were skipped."
+                if skipped_count
+                else "All selected stories are ready to download."
+            )
+            state["message"] = completion_message
             store.update_job(
                 job_id,
                 status=JobStatus.COMPLETED.value,
@@ -1024,7 +1157,7 @@ async def _run_stage(job_id: str, stage: str, function, *args) -> None:
                 "done",
                 _TOTAL_STEPS,
                 _TOTAL_STEPS,
-                "All selected stories are ready to download.",
+                completion_message,
                 100,
             )
         elif stage == "reconstruction":
@@ -1100,6 +1233,42 @@ async def _run_stage(job_id: str, stage: str, function, *args) -> None:
                 job_id=job_id,
                 level="ERROR",
                 error=exc,
+            )
+        elif (
+            stage == "generation"
+            and not get_state(job_id).get("stories")
+            and get_state(job_id).get("failed_stories")
+        ):
+            state = get_state(job_id)
+            state.update(
+                phase="awaiting_storyline",
+                discovery_revision=int(state.get("discovery_revision", 0)) + 1,
+                selected_storyline_ids=[],
+                selected_story_count=0,
+                message=(
+                    "No selected story produced an output. The failed arcs are "
+                    "unchecked; select other stories or rerun discovery."
+                ),
+            )
+            store.update_job(
+                job_id,
+                status=JobStatus.AWAITING_STORYLINE.value,
+                error=None,
+                auto_story=state,
+            )
+            store.update_progress(
+                job_id,
+                "awaiting_storyline",
+                2,
+                _TOTAL_STEPS,
+                state["message"],
+                65,
+            )
+            log_event(
+                "auto_story_generation_retryable",
+                component="auto_story",
+                job_id=job_id,
+                level="WARNING",
             )
         elif stage == "reconstruction":
             state = get_state(job_id)

@@ -580,9 +580,11 @@ def test_story_plan_retries_distinct_candidate_rounds(api, monkeypatch, tmp_path
         auto_story_worker, "_load_words", lambda _state: [{"word_id": "W1"}]
     )
     candidate_rounds = []
+    pacing_profiles = []
 
     def select_beats(*_args, candidate_round):
         candidate_rounds.append(candidate_round)
+        pacing_profiles.append((_args[5], _args[6]))
         if candidate_round < 2:
             raise ValueError("No valid schedule from these candidates.")
         return {"beats": []}, "cache-key"
@@ -621,7 +623,9 @@ def test_story_plan_retries_distinct_candidate_rounds(api, monkeypatch, tmp_path
     )
 
     assert candidate_rounds == [0, 1, 2]
+    assert pacing_profiles == [(30.0, 0.4), (30.0, 0.4), (15.0, 0.2)]
     assert story["validation"]["estimated_runtime_sec"] == 60.0
+    assert story["settings"]["min_gap_sec"] == 15.0
 
 
 def test_selected_storylines_are_planned_then_rendered_without_review(api, monkeypatch):
@@ -652,6 +656,8 @@ def test_selected_storylines_are_planned_then_rendered_without_review(api, monke
 
     def create_plan(_state, _context, arc, story_id):
         created.append((arc["id"], story_id))
+        if arc["id"] == "arc-1":
+            raise ValueError("No valid schedule after automatic pacing fallbacks.")
         return {
             "story_id": story_id,
             "storyline": arc,
@@ -681,11 +687,70 @@ def test_selected_storylines_are_planned_then_rendered_without_review(api, monke
         ["arc-1", "arc-3"],
     ))
 
-    assert created == [("arc-1", "story-1"), ("arc-3", "story-2")]
-    assert [story["story_id"] for story in rendered] == ["story-1", "story-2"]
-    assert store.get_job(job_id)["status"] == JobStatus.COMPLETED.value
-    assert store.get_job(job_id)["auto_story"]["phase"] == "completed"
-    assert store.get_job(job_id)["auto_story"]["output_files"] == ["story.mp4"]
+    saved_job = store.get_job(job_id)
+    assert created == [("arc-1", "story-1"), ("arc-3", "story-1")]
+    assert [story["story_id"] for story in rendered] == ["story-1"]
+    assert saved_job["status"] == JobStatus.COMPLETED.value
+    assert saved_job["auto_story"]["phase"] == "completed"
+    assert saved_job["auto_story"]["output_files"] == ["story.mp4"]
+    assert saved_job["auto_story"]["failed_stories"] == [{
+        "storyline_id": "arc-1",
+        "title": "Story 1",
+        "reason": "No valid schedule after automatic pacing fallbacks.",
+    }]
+    assert "1 unbuildable storyline(s) were skipped" in (
+        saved_job["auto_story"]["message"]
+    )
+
+
+def test_all_unbuildable_stories_return_to_selection_instead_of_failing(api, monkeypatch):
+    _, _ = api
+    job_id = store.create_job(
+        upload_filename="uploaded_episode.mp4",
+        source="local",
+        config={"auto_story_mode": True},
+    )
+    store.update_job(
+        job_id,
+        auto_story={
+            "discovery_revision": 0,
+            "source_id": "episode-test",
+            "source_duration_sec": 3600.0,
+            "transcript_key": "transcript-key",
+            "storylines": [
+                {"id": "arc-failed", "title": "Unschedulable story"}
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        auto_story_worker, "_source_context",
+        lambda _job: {"cfg": SimpleNamespace()},
+    )
+
+    def reject_plan(*_args):
+        raise ValueError("No feasible beat schedule.")
+
+    async def run_inline(_job_id, function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(auto_story_worker, "_create_story_plan", reject_plan)
+    monkeypatch.setattr(worker, "run_serialized_call", run_inline)
+
+    asyncio.run(auto_story_worker._run_stage(
+        job_id,
+        "generation",
+        auto_story_worker._create_selected_stories_sync,
+        ["arc-failed"],
+    ))
+
+    saved_job = store.get_job(job_id)
+    assert saved_job["status"] == JobStatus.AWAITING_STORYLINE.value
+    assert saved_job["error"] is None
+    assert saved_job["auto_story"]["discovery_revision"] == 1
+    assert saved_job["auto_story"]["selected_storyline_ids"] == []
+    assert saved_job["auto_story"]["failed_stories"][0]["title"] == (
+        "Unschedulable story"
+    )
 
 
 def test_complete_story_plan_validation_and_render_are_single_approval(api, monkeypatch):
@@ -968,7 +1033,7 @@ def test_reconstructing_one_story_preserves_the_other_plans(api, monkeypatch, tm
     assert discovery["count"] == 1
 
 
-def test_multi_story_render_writes_distinct_flat_output_files(api, monkeypatch, tmp_path):
+def test_multi_story_render_continues_after_one_story_fails(api, monkeypatch, tmp_path):
     job_id = store.create_job(
         upload_filename="uploaded_episode.mp4",
         source="local",
@@ -1027,6 +1092,8 @@ def test_multi_story_render_writes_distinct_flat_output_files(api, monkeypatch, 
 
     def fake_render(*_args, output_prefix=None):
         prefixes.append(output_prefix)
+        if output_prefix.startswith("story-1_"):
+            raise RuntimeError("Synthetic render failure.")
         return (
             str(tmp_path / f"{output_prefix}_story_montage.mp4"),
             str(tmp_path / f"{output_prefix}_story_montage.ass"),
@@ -1040,9 +1107,23 @@ def test_multi_story_render_writes_distinct_flat_output_files(api, monkeypatch, 
     )
 
     assert len(set(prefixes)) == 4
-    assert len([item for item in result["output_files"] if item["filename"].endswith(".mp4")]) == 4
+    assert len([
+        item for item in result["output_files"]
+        if item["filename"].endswith(".mp4")
+    ]) == 3
     assert result["output_files"][-1]["filename"] == "story_plan_manifest.json"
     assert (tmp_path / "outputs" / "story_plan_manifest.json").is_file()
+    plan_manifest = json.loads(
+        (tmp_path / "outputs" / "story_plan_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert plan_manifest["story_count"] == 3
+    assert plan_manifest["selected_story_count"] == 4
+    assert plan_manifest["failed_stories"][0]["title"] == "Story 1"
     saved_state = store.get_job(job_id)["auto_story"]
-    assert saved_state["rendered_story_count"] == 4
+    assert saved_state["rendered_story_count"] == 3
+    assert saved_state["failed_stories"][0]["reason"] == (
+        "Rendering failed: RuntimeError: Synthetic render failure."
+    )
     assert len(saved_state["output_files"]) == len(result["output_files"]) - 1

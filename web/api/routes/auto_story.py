@@ -173,7 +173,9 @@ async def select_storylines(
     state.update(
         phase="creating_stories",
         selected_storyline_ids=req.storyline_ids,
+        selected_story_count=len(req.storyline_ids),
         stories=[],
+        failed_stories=[],
         validation=None,
         output_files=[],
         rendered_story_count=0,
@@ -229,6 +231,8 @@ async def rediscover_storylines(job_id: str) -> JobResponse:
         storylines=[],
         story_count=0,
         selected_storyline_ids=[],
+        selected_story_count=0,
+        failed_stories=[],
         message="Rerunning story discovery with a fresh AI request.",
     )
     store.update_job(
