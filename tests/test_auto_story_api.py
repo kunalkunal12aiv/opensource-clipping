@@ -1,6 +1,8 @@
 """API tests for the dashboard-guided Auto Story workflow."""
 
 import asyncio
+import json
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 import pytest
@@ -229,6 +231,78 @@ def test_invalid_recipe_is_saved_and_previous_validation_is_cleared(api, monkeyp
     assert saved["recipe"] == submitted_recipe
     assert saved["validation"] is None
     assert saved["message"] == "Recipe needs changes: Beat is too short."
+
+
+def test_recipe_validation_saves_exact_cached_boundaries_and_dialogue(api, monkeypatch):
+    _, tmp_path = api
+    job_id = store.create_job(
+        upload_filename="uploaded_episode.mp4",
+        source="local",
+        config={"auto_story_mode": True},
+    )
+    storyline = {"id": "arc-1"}
+    store.update_job(
+        job_id,
+        auto_story={
+            "source_id": "episode-test",
+            "source_duration_sec": 500.0,
+            "selected_storyline_id": "arc-1",
+            "storylines": [storyline],
+            "recipe_filename": "review.json",
+        },
+    )
+    recipe = {
+        "source_id": "episode-test",
+        "storyline": storyline,
+        "beats": [{
+            "beat_id": 1,
+            "start_word_id": "W000001",
+            "end_word_id": "W000002",
+            "dialogue_start_sec": 10.01,
+            "dialogue_end_sec": 12.02,
+            "text": "old text",
+            "speaker_ids": ["SPEAKER_00"],
+        }],
+    }
+    accepted_beat = {
+        "start_word_id": "W000001",
+        "end_word_id": "W000003",
+        "dialogue_start_sec": 10.0,
+        "dialogue_end_sec": 13.0,
+        "text": "updated cached words",
+        "speaker_ids": ["SPEAKER_01"],
+    }
+    cfg = SimpleNamespace(
+        auto_story_target_duration=60,
+        auto_story_min_beat_sec=3.5,
+        auto_story_max_beat_sec=6.0,
+        auto_story_min_gap_sec=30,
+        auto_story_min_episode_span_ratio=0.4,
+        auto_story_padding_sec=0.18,
+        auto_story_crossfade_ms=60,
+    )
+    monkeypatch.setattr(
+        auto_story_worker, "_source_context",
+        lambda _job: {"cfg": cfg, "output_dir": str(tmp_path)},
+    )
+    monkeypatch.setattr(auto_story_worker, "_load_words", lambda _state: [])
+    monkeypatch.setattr(
+        pipeline,
+        "validate_review_recipe",
+        lambda *_args: {
+            "beats": [accepted_beat],
+            "estimated_runtime_sec": 60.0,
+            "episode_span_sec": 300.0,
+        },
+    )
+
+    result = auto_story_worker._validate_recipe_sync(job_id, recipe)
+
+    assert result["recipe"]["beats"][0]["dialogue_end_sec"] == 13.0
+    assert result["recipe"]["beats"][0]["text"] == "updated cached words"
+    assert result["recipe"]["beats"][0]["speaker_ids"] == ["SPEAKER_01"]
+    saved = json.loads((tmp_path / "review.json").read_text(encoding="utf-8"))
+    assert saved == result["recipe"]
 
 
 def test_discovery_stage_publishes_storylines_without_blocking_api(api, monkeypatch):

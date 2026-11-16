@@ -69,8 +69,10 @@ Open `http://127.0.0.1:5173`, select **Auto Story** in the sidebar, and:
 3. Wait for transcription and storyline discovery, then choose one of the three
    suggested storylines. The dashboard progress bar follows the transcript's
    audio progress; speaker identification is a separate step and can take time.
-4. Review the proposed dialogue beats. You can adjust start/end times; the
-   backend snaps them to transcript word boundaries and checks the constraints.
+4. Review the proposed dialogue beats. Use the **Add word** / **Remove word**
+   controls to move either edge by one transcript word at a time; these controls
+   use exact cached timestamps. You can still enter times manually. The backend
+   checks word boundaries and recipe constraints when you validate.
 5. Validate the recipe, then explicitly approve rendering. Preview or download
    the MP4, caption sidecar, manifest, and reviewed recipe from the results page.
 

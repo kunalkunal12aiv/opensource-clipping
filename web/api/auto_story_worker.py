@@ -313,6 +313,9 @@ def _select_beats_sync(job_id: str, storyline_id: str) -> dict:
     return {
         "selected_storyline_id": storyline_id,
         "recipe": recipe,
+        "timing_options": pipeline._build_review_timing_options(
+            recipe, arc, words
+        ),
         "recipe_filename": os.path.basename(review_path),
     }
 
@@ -350,8 +353,25 @@ def _validate_recipe_sync(job_id: str, recipe: dict) -> dict:
         cfg.auto_story_padding_sec,
         cfg.auto_story_crossfade_ms / 1000,
     )
+    normalized_beats = []
+    for submitted, accepted in zip(recipe["beats"], validated["beats"]):
+        normalized = dict(submitted)
+        for field in (
+            "start_word_id",
+            "end_word_id",
+            "dialogue_start_sec",
+            "dialogue_end_sec",
+            "text",
+            "speaker_ids",
+        ):
+            normalized[field] = accepted[field]
+        normalized_beats.append(normalized)
+    normalized_recipe = {**recipe, "beats": normalized_beats}
+    pipeline._write_json(
+        os.path.join(context["output_dir"], filename), normalized_recipe
+    )
     return {
-        "recipe": recipe,
+        "recipe": normalized_recipe,
         "validation": {
             "beat_count": len(validated["beats"]),
             "estimated_runtime_sec": validated["estimated_runtime_sec"],

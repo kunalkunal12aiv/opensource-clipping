@@ -889,6 +889,30 @@ html, body {
   font-size: 11px;
 }
 
+.auto-story-word-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  min-width: 0;
+}
+
+.auto-story-word-controls .btn {
+  flex: 0 0 auto;
+  padding: 5px 7px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.auto-story-boundary-word {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .auto-story-progress {
   margin-bottom: 20px;
 }

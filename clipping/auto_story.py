@@ -692,6 +692,78 @@ def _build_review_recipe(
     }
 
 
+def _build_review_timing_options(
+    recipe: dict,
+    arc: dict,
+    words: list[dict],
+    radius: int = 8,
+) -> dict:
+    positions = {word["word_id"]: index for index, word in enumerate(words)}
+    eligible_ranges = [
+        (
+            positions[item["start_word_id"]],
+            positions[item["end_word_id"]],
+        )
+        for item in arc["source_ranges"]
+    ]
+    max_duration = min(
+        6.5,
+        float(recipe.get("settings", {}).get("max_beat_sec", 6.0)) + 0.5,
+    )
+    options = {}
+
+    for index, beat in enumerate(recipe.get("beats", []), 1):
+        start_index = positions.get(beat.get("start_word_id"))
+        end_index = positions.get(beat.get("end_word_id"))
+        if start_index is None or end_index is None or end_index < start_index:
+            raise ValueError(f"Beat #{index} references invalid transcript words.")
+
+        source_range = next(
+            (
+                (range_start, range_end)
+                for range_start, range_end in eligible_ranges
+                if range_start <= start_index <= end_index <= range_end
+            ),
+            None,
+        )
+        if source_range is None:
+            raise ValueError(f"Beat #{index} is outside the selected storyline.")
+        range_start, range_end = source_range
+        start_word = words[start_index]
+        end_word = words[end_index]
+        beat_options = {"start": [], "end": []}
+
+        for option_index in range(
+            max(range_start, start_index - radius),
+            min(end_index, start_index + radius) + 1,
+        ):
+            option = words[option_index]
+            duration = end_word["end"] - option["start"]
+            if option_index == start_index or 0 < duration <= max_duration:
+                beat_options["start"].append({
+                    "time_sec": option["start"],
+                    "word": option["word"],
+                    "word_id": option["word_id"],
+                })
+
+        for option_index in range(
+            max(start_index, end_index - radius),
+            min(range_end, end_index + radius) + 1,
+        ):
+            option = words[option_index]
+            duration = option["end"] - start_word["start"]
+            if option_index == end_index or 0 < duration <= max_duration:
+                beat_options["end"].append({
+                    "time_sec": option["end"],
+                    "word": option["word"],
+                    "word_id": option["word_id"],
+                })
+
+        options[str(beat.get("beat_id", index))] = beat_options
+
+    return options
+
+
 def _nearest_word(words: list[dict], timestamp: float, endpoint: str) -> dict:
     key = "start" if endpoint == "start" else "end"
     nearest = min(words, key=lambda word: abs(word[key] - timestamp))

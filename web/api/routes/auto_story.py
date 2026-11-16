@@ -129,6 +129,7 @@ async def select_storyline(
         phase="beat_selection",
         selected_storyline_id=req.storyline_id,
         recipe=None,
+        timing_options=None,
         validation=None,
         message="Selecting dialogue beats for the chosen storyline.",
     )

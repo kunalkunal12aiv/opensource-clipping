@@ -238,6 +238,67 @@ def test_recipe_validation_enforces_span_gaps_and_runtime():
         )
 
 
+def test_review_timing_options_use_cached_word_boundaries_and_respect_duration():
+    words, arc, beats = _episode_words()
+    recipe = auto_story._build_review_recipe(
+        {"beats": beats},
+        arc,
+        words,
+        "episode",
+        {"target_duration_sec": 60},
+    )
+
+    options = auto_story._build_review_timing_options(
+        recipe, arc, words, radius=2
+    )
+
+    assert options["1"]["start"] == [
+        {"time_sec": 100.0, "word": "word0", "word_id": "W000001"},
+        {"time_sec": 102.5, "word": "finished.", "word_id": "W000002"},
+    ]
+    assert options["1"]["end"] == [
+        {"time_sec": 102.5, "word": "word0", "word_id": "W000001"},
+        {"time_sec": 105.0, "word": "finished.", "word_id": "W000002"},
+    ]
+
+
+def test_review_timing_options_offer_exact_end_to_extend_short_beat():
+    words = [
+        {"word_id": "W000001", "word": "If", "start": 877.26, "end": 877.4},
+        {"word_id": "W000002", "word": "again.", "start": 879.5, "end": 879.96},
+        {"word_id": "W000003", "word": "Uproot", "start": 880.5, "end": 880.9},
+        {"word_id": "W000004", "word": "our", "start": 880.91, "end": 881.04},
+        {"word_id": "W000005", "word": "lives.", "start": 881.1, "end": 881.46},
+    ]
+    arc = {
+        "id": "arc_1",
+        "source_ranges": [{
+            "start_word_id": "W000001",
+            "end_word_id": "W000005",
+        }],
+    }
+    recipe = auto_story._build_review_recipe(
+        {
+            "beats": [{
+                "start_word_id": "W000001",
+                "end_word_id": "W000002",
+            }],
+        },
+        arc,
+        words,
+        "episode",
+        {"target_duration_sec": 60, "max_beat_sec": 6.0},
+    )
+
+    options = auto_story._build_review_timing_options(recipe, arc, words)
+
+    assert {
+        "time_sec": 881.46,
+        "word": "lives.",
+        "word_id": "W000005",
+    } in options["1"]["end"]
+
+
 def test_storyline_and_beat_ai_passes_reuse_cached_responses(monkeypatch, tmp_path):
     words = [
         {

@@ -11,6 +11,7 @@ All notable changes to the **OpenSource Clipping** project will be documented in
 
 ### Added
 - **Kaggle Auto Story GPU workflow**: Use the Auto Story dashboard against the Kaggle backend, select CUDA for Faster-Whisper when available, and document the local-dashboard-to-Kaggle tunnel setup.
+- **Auto Story word-step timing controls**: Adjust beat edges by one cached transcript word at a time using exact word timestamps, while preserving manual time entry.
 - **Auto Story-Recipe dashboard workflow**: Add a guided Studio page and staged API workflow for uploading an episode, selecting one of three discovered storylines, reviewing/editing dialogue-beat times, validating the recipe, and explicitly approving rendering. The existing CLI workflow remains available. Faster-Whisper word timestamps, PyAnnote speaker turns, and Gemini/NVIDIA pass results remain cached.
 - **Auto Story transcription progress and resilience**: Reflect Faster-Whisper audio progress in the dashboard and continue when an isolated word has a zero-length timestamp, with a terminal warning; invalid or reversed timestamps still fail explicitly.
 - **PyAnnote/torchaudio compatibility**: Pin the tested PyAnnote 3.3.2 and matched PyTorch/Torchaudio 2.5.1 stack so speaker diarization retains the `AudioMetaData` API without moving MediaPipe to NumPy 2.

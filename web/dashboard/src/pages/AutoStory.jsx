@@ -28,6 +28,7 @@ function AutoStory() {
   const [creating, setCreating] = useState(false)
   const [job, setJob] = useState(null)
   const [recipe, setRecipe] = useState(null)
+  const [timingOptions, setTimingOptions] = useState(null)
   const [validated, setValidated] = useState(false)
   const [validating, setValidating] = useState(false)
   const [selecting, setSelecting] = useState(false)
@@ -61,6 +62,7 @@ function AutoStory() {
         setJob(data)
         if (data.auto_story?.recipe && !recipeTouched.current) {
           setRecipe(data.auto_story.recipe)
+          setTimingOptions(data.auto_story.timing_options || null)
           setValidated(Boolean(data.auto_story.validation))
         }
         if (!TERMINAL_STATUSES.includes(data.status)) {
@@ -127,6 +129,7 @@ function AutoStory() {
       setJob(await selectAutoStoryline(jobId, storylineId))
       recipeTouched.current = false
       setRecipe(null)
+      setTimingOptions(null)
       setValidated(false)
     } catch (err) {
       setError(err.message)
@@ -144,6 +147,79 @@ function AutoStory() {
       beats: current.beats.map((beat, beatIndex) =>
         beatIndex === index ? { ...beat, [key]: value } : beat,
       ),
+    }))
+  }
+
+  const getAdjacentBoundary = (beatIndex, key, direction) => {
+    const beat = recipe?.beats?.[beatIndex]
+    const options = timingOptions?.[String(beat?.beat_id ?? beatIndex + 1)]?.[key] || []
+    const currentTime = Number(beat?.[key === 'start' ? 'dialogue_start_sec' : 'dialogue_end_sec'])
+    if (!Number.isFinite(currentTime)) return null
+
+    const candidates = options.filter(option => (
+      direction < 0 ? option.time_sec < currentTime - 0.005 : option.time_sec > currentTime + 0.005
+    ))
+    return direction < 0 ? candidates[candidates.length - 1] || null : candidates[0] || null
+  }
+
+  const getBoundaryWord = (beat, beatIndex, key) => {
+    const options = timingOptions?.[String(beat.beat_id ?? beatIndex + 1)]?.[key] || []
+    const field = key === 'start' ? 'dialogue_start_sec' : 'dialogue_end_sec'
+    const currentTime = Number(beat[field])
+    if (!Number.isFinite(currentTime)) return null
+    const nearest = options.reduce((best, option) => (
+      !best || Math.abs(option.time_sec - currentTime) < Math.abs(best.time_sec - currentTime)
+        ? option
+        : best
+    ), null)
+    return nearest && Math.abs(nearest.time_sec - currentTime) <= 0.05 ? nearest.word : null
+  }
+
+  const moveBeatBoundary = (beatIndex, key, direction) => {
+    const next = getAdjacentBoundary(beatIndex, key, direction)
+    if (!next) return
+
+    const beat = recipe.beats[beatIndex]
+    const options = timingOptions?.[String(beat.beat_id ?? beatIndex + 1)]?.[key] || []
+    const idField = key === 'start' ? 'start_word_id' : 'end_word_id'
+    const currentIndex = options.findIndex(option => option.word_id === beat[idField])
+    const nextIndex = options.findIndex(option => option.word_id === next.word_id)
+    let textWords = String(beat.text || '').split(/\s+/).filter(Boolean)
+
+    if (currentIndex >= 0 && nextIndex >= 0) {
+      if (key === 'start' && nextIndex < currentIndex) {
+        textWords = [
+          ...options.slice(nextIndex, currentIndex).map(option => option.word),
+          ...textWords,
+        ]
+      } else if (key === 'start' && nextIndex > currentIndex) {
+        textWords = textWords.slice(nextIndex - currentIndex)
+      } else if (key === 'end' && nextIndex > currentIndex) {
+        textWords = [
+          ...textWords,
+          ...options.slice(currentIndex + 1, nextIndex + 1).map(option => option.word),
+        ]
+      } else if (key === 'end' && nextIndex < currentIndex) {
+        textWords = textWords.slice(0, Math.max(0, textWords.length - (currentIndex - nextIndex)))
+      }
+    }
+
+    const field = key === 'start' ? 'dialogue_start_sec' : 'dialogue_end_sec'
+    recipeTouched.current = true
+    setValidated(false)
+    setError('')
+    setRecipe(current => ({
+      ...current,
+      beats: current.beats.map((item, index) => (
+        index === beatIndex
+          ? {
+            ...item,
+            [field]: next.time_sec,
+            [idField]: next.word_id,
+            text: textWords.join(' '),
+          }
+          : item
+      )),
     }))
   }
 
@@ -374,7 +450,7 @@ function AutoStory() {
         <section className="auto-story-section">
           <h3>4. Review the dialogue beats</h3>
           <p className="auto-story-help">
-            Adjust the start/end times if needed. Times snap to transcript word boundaries; validation checks pacing and total length before rendering.
+            Adjust the start/end times if needed. Use the word buttons to move to exact transcript boundaries: Start adds/removes words on the left; End removes/adds words on the right. Validation checks pacing and total length before rendering.
           </p>
           <div className="auto-story-beats">
             {recipe.beats?.map((beat, index) => (
@@ -389,26 +465,46 @@ function AutoStory() {
                   </div>
                 </div>
                 <div className="auto-story-time-fields">
-                  <label>
-                    Start (seconds)
-                    <input
-                      className="form-input"
-                      type="number"
-                      step="0.01"
-                      value={beat.dialogue_start_sec}
-                      onChange={event => editBeat(index, 'dialogue_start_sec', event.target.value)}
-                    />
-                  </label>
-                  <label>
-                    End (seconds)
-                    <input
-                      className="form-input"
-                      type="number"
-                      step="0.01"
-                      value={beat.dialogue_end_sec}
-                      onChange={event => editBeat(index, 'dialogue_end_sec', event.target.value)}
-                    />
-                  </label>
+                  {[
+                    { key: 'start', field: 'dialogue_start_sec', label: 'Start (seconds)' },
+                    { key: 'end', field: 'dialogue_end_sec', label: 'End (seconds)' },
+                  ].map(({ key, field, label }) => (
+                    <label key={key}>
+                      {label}
+                      <input
+                        className="form-input"
+                        type="number"
+                        step="0.01"
+                        value={beat[field]}
+                        onChange={event => editBeat(index, field, event.target.value)}
+                      />
+                      {timingOptions?.[String(beat.beat_id ?? index + 1)]?.[key] && (
+                        <span className="auto-story-word-controls">
+                          <button
+                            type="button"
+                            className="btn btn-ghost btn-sm"
+                            onClick={() => moveBeatBoundary(index, key, -1)}
+                            disabled={!getAdjacentBoundary(index, key, -1)}
+                            aria-label={`Move beat ${index + 1} ${key} boundary one word earlier`}
+                          >
+                            {key === 'start' ? '← Add word' : '← Remove word'}
+                          </button>
+                          <span className="auto-story-boundary-word" title={getBoundaryWord(beat, index, key) || 'Time is not on a cached word boundary'}>
+                            {getBoundaryWord(beat, index, key) || 'Custom time'}
+                          </span>
+                          <button
+                            type="button"
+                            className="btn btn-ghost btn-sm"
+                            onClick={() => moveBeatBoundary(index, key, 1)}
+                            disabled={!getAdjacentBoundary(index, key, 1)}
+                            aria-label={`Move beat ${index + 1} ${key} boundary one word later`}
+                          >
+                            {key === 'start' ? 'Remove word →' : 'Add word →'}
+                          </button>
+                        </span>
+                      )}
+                    </label>
+                  ))}
                 </div>
               </article>
             ))}
