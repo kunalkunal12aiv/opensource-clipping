@@ -852,6 +852,17 @@ html, body {
   margin: 8px 0;
 }
 
+.auto-story-storyline-choice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.auto-story-storyline-choice input {
+  accent-color: var(--accent);
+}
+
 .auto-story-storyline > p {
   color: var(--text-secondary);
   font-size: 13px;

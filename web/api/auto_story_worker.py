@@ -237,13 +237,14 @@ def _discover_sync(job_id: str) -> dict:
     )
     _check_cancelled(job_id)
 
-    story_count = int(job.get("config", {}).get("story_count", 4))
+    state = get_state(job_id)
+    discovery_revision = int(state.get("discovery_revision", 0))
     _set_progress(
         job_id,
         JobStatus.ANALYZING,
         "storyline_discovery",
         2,
-        f"Finding {story_count} distinct story arcs in the transcript.",
+        "Finding the distinct story arcs this episode can support.",
         60,
     )
     storylines = pipeline._discover_storylines(
@@ -253,44 +254,20 @@ def _discover_sync(job_id: str) -> dict:
         context["auto_cache_dir"],
         context["output_dir"],
         cfg,
-        count=story_count,
+        count=None,
         target_duration_sec=cfg.auto_story_target_duration,
         min_gap_sec=cfg.auto_story_min_gap_sec,
+        cache_variant=f"discovery-{discovery_revision}",
     )
-    plan_state = {
-        "source_id": context["source_id"],
-        "source_name": context["source"]["name"],
-        "source_duration_sec": duration,
-        "transcript_key": transcript_key,
-        "target_duration_sec": cfg.auto_story_target_duration,
-    }
-    story_plans = []
-    for index, arc in enumerate(storylines, 1):
-        _check_cancelled(job_id)
-        store.update_progress(
-            job_id,
-            "story_planning",
-            2,
-            _TOTAL_STEPS,
-            f"Planning story {index} of {story_count}: {arc['title']}.",
-            60 + (20 * index / story_count),
-        )
-        story_plans.append(_create_story_plan(
-            plan_state,
-            context,
-            arc,
-            f"story-{index}",
-        ))
-    _check_cancelled(job_id)
     return {
         "source_id": context["source_id"],
         "source_name": context["source"]["name"],
         "source_duration_sec": duration,
         "transcript_key": transcript_key,
         "storylines": storylines,
-        "stories": story_plans,
-        "validation": _aggregate_story_validation(story_plans),
-        "reconstruction_counts": {},
+        "stories": [],
+        "story_count": len(storylines),
+        "discovery_revision": discovery_revision,
     }
 
 
@@ -315,62 +292,72 @@ def _create_story_plan(
         "padding_sec": cfg.auto_story_padding_sec,
         "crossfade_sec": crossfade_sec,
     }
-    response, cache_key = pipeline._select_beats(
-        arc,
-        words,
-        cfg.auto_story_target_duration,
-        cfg.auto_story_min_beat_sec,
-        cfg.auto_story_max_beat_sec,
-        cfg.auto_story_min_gap_sec,
-        story_span_ratio,
-        state["source_duration_sec"],
-        cfg.auto_story_padding_sec,
-        crossfade_sec,
-        state["transcript_key"],
-        context["auto_cache_dir"],
-        cfg,
-    )
-    review_path = os.path.join(
-        context["output_dir"],
-        f"{story_id}_recipe_review_{cache_key[:12]}.json",
-    )
-    if os.path.exists(review_path):
-        with open(review_path, "r", encoding="utf-8") as file:
-            recipe = json.load(file)
-    else:
-        recipe = pipeline._build_review_recipe(
-            response, arc, words, state["source_id"], settings
-        )
-    validated = pipeline.validate_review_recipe(
-        recipe,
-        arc,
-        words,
-        state["source_id"],
-        state["source_duration_sec"],
-        settings["target_duration_sec"],
-        settings["min_beat_sec"],
-        settings["max_beat_sec"],
-        settings["min_gap_sec"],
-        settings["min_episode_span_ratio"],
-        settings["padding_sec"],
-        settings["crossfade_sec"],
-    )
-    recipe = _normalize_review_recipe(recipe, validated)
-    pipeline._write_json(review_path, recipe)
-    return {
-        "story_id": story_id,
-        "storyline": arc,
-        "recipe": recipe,
-        "timing_options": pipeline._build_review_timing_options(
-            recipe, arc, words
-        ),
-        "recipe_filename": os.path.basename(review_path),
-        "validation": {
-            "beat_count": len(validated["beats"]),
-            "estimated_runtime_sec": validated["estimated_runtime_sec"],
-            "episode_span_sec": validated["episode_span_sec"],
-        },
-    }
+    last_error = None
+    for candidate_round in range(3):
+        try:
+            response, cache_key = pipeline._select_beats(
+                arc,
+                words,
+                cfg.auto_story_target_duration,
+                cfg.auto_story_min_beat_sec,
+                cfg.auto_story_max_beat_sec,
+                cfg.auto_story_min_gap_sec,
+                story_span_ratio,
+                state["source_duration_sec"],
+                cfg.auto_story_padding_sec,
+                crossfade_sec,
+                state["transcript_key"],
+                context["auto_cache_dir"],
+                cfg,
+                candidate_round=candidate_round,
+            )
+            recipe_path = os.path.join(
+                context["output_dir"],
+                f"{story_id}_recipe_{cache_key[:12]}.json",
+            )
+            if os.path.exists(recipe_path):
+                with open(recipe_path, "r", encoding="utf-8") as file:
+                    recipe = json.load(file)
+            else:
+                recipe = pipeline._build_review_recipe(
+                    response, arc, words, state["source_id"], settings
+                )
+            validated = pipeline.validate_review_recipe(
+                recipe,
+                arc,
+                words,
+                state["source_id"],
+                state["source_duration_sec"],
+                settings["target_duration_sec"],
+                settings["min_beat_sec"],
+                settings["max_beat_sec"],
+                settings["min_gap_sec"],
+                settings["min_episode_span_ratio"],
+                settings["padding_sec"],
+                settings["crossfade_sec"],
+            )
+            recipe = _normalize_review_recipe(recipe, validated)
+            pipeline._write_json(recipe_path, recipe)
+            return {
+                "story_id": story_id,
+                "storyline": arc,
+                "recipe": recipe,
+                "timing_options": pipeline._build_review_timing_options(
+                    recipe, arc, words
+                ),
+                "recipe_filename": os.path.basename(recipe_path),
+                "validation": {
+                    "beat_count": len(validated["beats"]),
+                    "estimated_runtime_sec": validated["estimated_runtime_sec"],
+                    "episode_span_sec": validated["episode_span_sec"],
+                },
+            }
+        except ValueError as exc:
+            last_error = exc
+    raise ValueError(
+        f"Could not build story {arc['title']!r} after three different "
+        f"dialogue-candidate attempts: {last_error}"
+    ) from last_error
 
 
 def _story_span_ratio(cfg, arc: dict, episode_duration: float) -> float:
@@ -400,6 +387,66 @@ def _aggregate_story_validation(stories: list[dict]) -> dict:
             for item in stories
         ],
     }
+
+
+def _create_selected_stories_sync(
+    job_id: str,
+    storyline_ids: list[str],
+) -> dict:
+    job = _job(job_id)
+    state = get_state(job_id)
+    context = _source_context(job)
+    storylines = state.get("storylines", [])
+    by_id = {arc["id"]: arc for arc in storylines}
+    if not storyline_ids or any(story_id not in by_id for story_id in storyline_ids):
+        raise ValueError("Select one or more storylines from the discovered list.")
+    if len(set(storyline_ids)) != len(storyline_ids):
+        raise ValueError("Selected storylines must be unique.")
+
+    stories = []
+    for index, storyline_id in enumerate(storyline_ids, 1):
+        _check_cancelled(job_id)
+        arc = by_id[storyline_id]
+        store.update_progress(
+            job_id,
+            "story_planning",
+            3,
+            _TOTAL_STEPS,
+            f"Creating story {index} of {len(storyline_ids)}: {arc['title']}.",
+            60 + (20 * (index - 1) / len(storyline_ids)),
+        )
+        story = _create_story_plan(
+            state,
+            context,
+            arc,
+            f"story-{index}",
+        )
+        stories.append(story)
+        state = _update_state(
+            job_id,
+            selected_storyline_ids=storyline_ids,
+            stories=list(stories),
+            story_count=len(storylines),
+            validation=_aggregate_story_validation(stories),
+            output_files=[],
+            rendered_story_count=0,
+            phase="planning",
+            message=(
+                f"Created and validated {index} of {len(storyline_ids)} "
+                "selected stories."
+            ),
+        )
+
+    _check_cancelled(job_id)
+    state = _update_state(
+        job_id,
+        stories=stories,
+        story_count=len(storylines),
+        validation=_aggregate_story_validation(stories),
+        phase="rendering",
+        message=f"Rendering {len(stories)} selected stories.",
+    )
+    return _render_stories_sync(job_id, _job(job_id), state)
 
 
 def _select_beats_sync(job_id: str, storyline_id: str) -> dict:
@@ -929,40 +976,30 @@ async def _run_stage(job_id: str, stage: str, function, *args) -> None:
         result = await worker.run_serialized_call(job_id, function, job_id, *args)
         _check_cancelled(job_id)
         if stage == "discovery":
-            if result.get("stories"):
-                state = _update_state(
-                    job_id,
-                    **result,
-                    phase="awaiting_recipe",
-                    message=(
-                        f"All {len(result['stories'])} story plans are ready "
-                        "for review."
-                    ),
-                )
-                store.update_job(
-                    job_id,
-                    status=JobStatus.AWAITING_RECIPE.value,
-                    auto_story=state,
-                )
-                store.update_progress(
-                    job_id,
-                    "awaiting_recipe",
-                    3,
-                    _TOTAL_STEPS,
-                    "The complete story plan is ready for review.",
-                    80,
-                )
-            else:
-                state = _update_state(job_id, **result, phase="awaiting_storyline")
-                store.update_job(job_id, status=JobStatus.AWAITING_STORYLINE.value)
-                store.update_progress(
-                    job_id,
-                    "awaiting_storyline",
-                    2,
-                    _TOTAL_STEPS,
-                    "Choose the storyline you want to build.",
-                    65,
-                )
+            count = len(result.get("storylines", []))
+            state = _update_state(
+                job_id,
+                **result,
+                phase="awaiting_storyline",
+                message=(
+                    f"Found {count} storylines. Choose which ones to create."
+                    if count
+                    else "No clear storylines found. Rerun story discovery."
+                ),
+            )
+            store.update_job(
+                job_id,
+                status=JobStatus.AWAITING_STORYLINE.value,
+                auto_story=state,
+            )
+            store.update_progress(
+                job_id,
+                "awaiting_storyline",
+                2,
+                _TOTAL_STEPS,
+                state["message"],
+                65,
+            )
         elif stage == "selection":
             _update_state(job_id, **result, phase="awaiting_recipe")
             store.update_job(job_id, status=JobStatus.AWAITING_RECIPE.value)
@@ -973,6 +1010,22 @@ async def _run_stage(job_id: str, stage: str, function, *args) -> None:
                 _TOTAL_STEPS,
                 "Review the proposed dialogue beats, then validate them.",
                 75,
+            )
+        elif stage == "generation":
+            state = _update_state(job_id, **result, phase="completed")
+            store.update_job(
+                job_id,
+                status=JobStatus.COMPLETED.value,
+                error=None,
+                auto_story=state,
+            )
+            store.update_progress(
+                job_id,
+                "done",
+                _TOTAL_STEPS,
+                _TOTAL_STEPS,
+                "All selected stories are ready to download.",
+                100,
             )
         elif stage == "reconstruction":
             state = _update_state(
@@ -1021,7 +1074,34 @@ async def _run_stage(job_id: str, stage: str, function, *args) -> None:
     except worker.JobCancelled:
         _mark_cancelled(job_id)
     except Exception as exc:
-        if stage == "reconstruction":
+        if stage == "discovery":
+            state = get_state(job_id)
+            state.update(
+                phase="awaiting_storyline",
+                message=f"Story discovery failed: {exc}. You can rerun discovery.",
+            )
+            store.update_job(
+                job_id,
+                status=JobStatus.AWAITING_STORYLINE.value,
+                error=None,
+                auto_story=state,
+            )
+            store.update_progress(
+                job_id,
+                "awaiting_storyline",
+                2,
+                _TOTAL_STEPS,
+                state["message"],
+                60,
+            )
+            log_event(
+                "auto_story_discovery_failed",
+                component="auto_story",
+                job_id=job_id,
+                level="ERROR",
+                error=exc,
+            )
+        elif stage == "reconstruction":
             state = get_state(job_id)
             state.pop("reconstructing_story_id", None)
             state.update(
@@ -1073,6 +1153,22 @@ async def submit_discovery(job_id: str) -> None:
 
 async def submit_selection(job_id: str, storyline_id: str) -> None:
     _start(job_id, "selection", _select_beats_sync, storyline_id)
+
+
+async def submit_storyline_selection(
+    job_id: str,
+    storyline_ids: list[str],
+) -> None:
+    _start(
+        job_id,
+        "generation",
+        _create_selected_stories_sync,
+        storyline_ids,
+    )
+
+
+async def submit_rediscovery(job_id: str) -> None:
+    _start(job_id, "discovery", _discover_sync)
 
 
 async def submit_reconstruction(

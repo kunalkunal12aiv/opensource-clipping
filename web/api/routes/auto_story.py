@@ -11,6 +11,7 @@ from .. import auto_story_worker, config_adapter, store, worker
 from ..models import (
     AutoStoryCreateRequest,
     AutoStoryRecipeRequest,
+    AutoStorySelectionRequest,
     AutoStorylineSelectionRequest,
     JobResponse,
     JobStatus,
@@ -71,7 +72,6 @@ async def create_auto_story(req: AutoStoryCreateRequest) -> JobResponse:
     config = {
         "auto_story_mode": True,
         "target_duration_sec": req.target_duration_sec,
-        "story_count": req.story_count,
         "ai_provider": provider,
         "source_name": req.source_name,
         "auto_story_whisper_model": "small",
@@ -88,10 +88,11 @@ async def create_auto_story(req: AutoStoryCreateRequest) -> JobResponse:
         auto_story={
             "phase": "queued",
             "target_duration_sec": req.target_duration_sec,
-            "story_count": req.story_count,
+            "story_count": 0,
             "source_name": req.source_name,
             "storylines": [],
             "stories": [],
+            "discovery_revision": 0,
             "recipe": None,
             "validation": None,
             "output_files": [],
@@ -146,6 +147,116 @@ async def select_storyline(
     try:
         await auto_story_worker.submit_selection(job_id, req.storyline_id)
     except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _job_to_response(store.get_job(job_id))
+
+
+@router.post("/{job_id}/storylines/select", response_model=JobResponse)
+async def select_storylines(
+    job_id: str, req: AutoStorySelectionRequest
+) -> JobResponse:
+    job = _require_auto_story_job(job_id)
+    if job.get("status") != JobStatus.AWAITING_STORYLINE.value:
+        raise HTTPException(
+            status_code=409,
+            detail="Storylines can only be selected after discovery.",
+        )
+    state = dict(job.get("auto_story") or {})
+    available_ids = {
+        item.get("id") for item in state.get("storylines", [])
+    }
+    if not set(req.storyline_ids).issubset(available_ids):
+        raise HTTPException(
+            status_code=422,
+            detail="Select only storylines shown for this episode.",
+        )
+    state.update(
+        phase="creating_stories",
+        selected_storyline_ids=req.storyline_ids,
+        stories=[],
+        validation=None,
+        output_files=[],
+        rendered_story_count=0,
+        message=(
+            f"Creating and rendering {len(req.storyline_ids)} selected stories."
+        ),
+    )
+    store.update_job(
+        job_id,
+        auto_story=state,
+        status=JobStatus.ANALYZING.value,
+        error=None,
+    )
+    store.update_progress(
+        job_id,
+        "story_selection",
+        3,
+        4,
+        state["message"],
+        65,
+    )
+    try:
+        await auto_story_worker.submit_storyline_selection(
+            job_id, req.storyline_ids
+        )
+    except ValueError as exc:
+        state.update(
+            phase="awaiting_storyline",
+            message="Could not start story creation. Please select again.",
+        )
+        store.update_job(
+            job_id,
+            auto_story=state,
+            status=JobStatus.AWAITING_STORYLINE.value,
+        )
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _job_to_response(store.get_job(job_id))
+
+
+@router.post("/{job_id}/storylines/rediscover", response_model=JobResponse)
+async def rediscover_storylines(job_id: str) -> JobResponse:
+    job = _require_auto_story_job(job_id)
+    if job.get("status") != JobStatus.AWAITING_STORYLINE.value:
+        raise HTTPException(
+            status_code=409,
+            detail="Story discovery can only be rerun before selecting stories.",
+        )
+    state = dict(job.get("auto_story") or {})
+    revision = int(state.get("discovery_revision", 0)) + 1
+    state.update(
+        phase="storyline_discovery",
+        discovery_revision=revision,
+        storylines=[],
+        story_count=0,
+        selected_storyline_ids=[],
+        message="Rerunning story discovery with a fresh AI request.",
+    )
+    store.update_job(
+        job_id,
+        auto_story=state,
+        status=JobStatus.ANALYZING.value,
+        error=None,
+    )
+    store.update_progress(
+        job_id,
+        "storyline_discovery",
+        2,
+        4,
+        state["message"],
+        55,
+    )
+    try:
+        await auto_story_worker.submit_rediscovery(job_id)
+    except ValueError as exc:
+        state.update(
+            phase="awaiting_storyline",
+            message="Could not rerun story discovery. Please try again.",
+        )
+        store.update_job(
+            job_id,
+            auto_story=state,
+            status=JobStatus.AWAITING_STORYLINE.value,
+        )
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return _job_to_response(store.get_job(job_id))
 

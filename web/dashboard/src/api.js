@@ -54,6 +54,20 @@ export async function selectAutoStoryline(jobId, storylineId) {
   })
 }
 
+export async function selectAutoStorylines(jobId, storylineIds) {
+  return autoStoryRequest(`/${encodeURIComponent(jobId)}/storylines/select`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ storyline_ids: storylineIds }),
+  })
+}
+
+export async function rediscoverAutoStorylines(jobId) {
+  return autoStoryRequest(`/${encodeURIComponent(jobId)}/storylines/rediscover`, {
+    method: 'POST',
+  })
+}
+
 export async function validateAutoStoryRecipe(jobId, recipe) {
   return autoStoryRequest(`/${encodeURIComponent(jobId)}/recipe`, {
     method: 'PUT',

@@ -5,9 +5,11 @@ import {
   createAutoStory,
   fetchAutoStory,
   fetchSettings,
+  rediscoverAutoStorylines,
   reconstructAutoStoryStory,
   renderAutoStory,
   selectAutoStoryline,
+  selectAutoStorylines,
   uploadVideo,
   validateAutoStoryRecipe,
   validateAutoStoryPlan,
@@ -20,13 +22,14 @@ function AutoStory() {
   const navigate = useNavigate()
   const fileRef = useRef(null)
   const planTouched = useRef(false)
+  const selectionTouched = useRef(false)
+  const displayedDiscoveryRevision = useRef(null)
   const [settings, setSettings] = useState(null)
   const [settingsError, setSettingsError] = useState('')
   const [selectedFile, setSelectedFile] = useState(null)
   const [uploadFilename, setUploadFilename] = useState('')
   const [uploading, setUploading] = useState(false)
   const [targetDuration, setTargetDuration] = useState(60)
-  const [storyCount, setStoryCount] = useState(4)
   const [provider, setProvider] = useState('gemini')
   const [creating, setCreating] = useState(false)
   const [job, setJob] = useState(null)
@@ -36,7 +39,9 @@ function AutoStory() {
   const [validated, setValidated] = useState(false)
   const [legacyValidated, setLegacyValidated] = useState(false)
   const [validating, setValidating] = useState(false)
+  const [selectedStorylineIds, setSelectedStorylineIds] = useState([])
   const [selecting, setSelecting] = useState(false)
+  const [rediscovering, setRediscovering] = useState(false)
   const [reconstructingStoryId, setReconstructingStoryId] = useState('')
   const [rendering, setRendering] = useState(false)
   const [cancelling, setCancelling] = useState(false)
@@ -67,6 +72,24 @@ function AutoStory() {
         const data = await fetchAutoStory(jobId)
         if (!active) return
         setJob(data)
+        const currentDiscoveryRevision = data.auto_story?.discovery_revision ?? 0
+        if (
+          data.status === 'awaiting_storyline'
+          && displayedDiscoveryRevision.current !== currentDiscoveryRevision
+        ) {
+          displayedDiscoveryRevision.current = currentDiscoveryRevision
+          selectionTouched.current = false
+          setSelectedStorylineIds(
+            (data.auto_story.storylines || []).map(storyline => storyline.id),
+          )
+        } else if (
+          data.status === 'awaiting_storyline'
+          && !selectionTouched.current
+        ) {
+          setSelectedStorylineIds(
+            (data.auto_story.storylines || []).map(storyline => storyline.id),
+          )
+        }
         if (data.auto_story?.stories?.length && !planTouched.current) {
           setStories(data.auto_story.stories)
           setValidated(Boolean(
@@ -132,7 +155,6 @@ function AutoStory() {
         upload_filename: uploadFilename,
         source_name: selectedFile.name,
         target_duration_sec: Number(targetDuration),
-        story_count: Number(storyCount),
         ai_provider: provider,
       })
       navigate(`/auto-story/${created.id}`)
@@ -157,6 +179,44 @@ function AutoStory() {
       setError(err.message)
     } finally {
       setSelecting(false)
+    }
+  }
+
+  const toggleStoryline = (storylineId) => {
+    selectionTouched.current = true
+    setSelectedStorylineIds(current => (
+      current.includes(storylineId)
+        ? current.filter(id => id !== storylineId)
+        : [...current, storylineId]
+    ))
+  }
+
+  const createSelectedStories = async () => {
+    if (!selectedStorylineIds.length) return
+    setSelecting(true)
+    setError('')
+    try {
+      const updated = await selectAutoStorylines(jobId, selectedStorylineIds)
+      setJob(updated)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setSelecting(false)
+    }
+  }
+
+  const rerunStorylineDiscovery = async () => {
+    setRediscovering(true)
+    setError('')
+    try {
+      selectionTouched.current = false
+      setSelectedStorylineIds([])
+      const updated = await rediscoverAutoStorylines(jobId)
+      setJob(updated)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setRediscovering(false)
     }
   }
 
@@ -428,8 +488,8 @@ function AutoStory() {
       <div className="fade-in">
         <div className="page-header">
           <div>
-            <h2>Auto Story-Recipe</h2>
-            <p>Create a reviewed, dialogue-led montage from one episode.</p>
+            <h2>Auto Story</h2>
+            <p>Choose storylines once; Auto Story builds and renders them automatically.</p>
           </div>
         </div>
 
@@ -465,20 +525,8 @@ function AutoStory() {
           </div>
 
           <div className="card auto-story-card">
-            <h3 className="card-title">2. Plan your story set</h3>
+            <h3 className="card-title">2. Set your story length</h3>
             <div className="auto-story-options">
-              <div className="form-group">
-                <label className="form-label" htmlFor="auto-story-count">Number of stories</label>
-                <select
-                  id="auto-story-count"
-                  className="form-select"
-                  value={storyCount}
-                  onChange={event => setStoryCount(event.target.value)}
-                >
-                  <option value={4}>4 independent story arcs</option>
-                  <option value={5}>5 independent story arcs</option>
-                </select>
-              </div>
               <div className="form-group">
                 <label className="form-label" htmlFor="auto-story-duration">Target duration per story</label>
                 <select
@@ -506,8 +554,8 @@ function AutoStory() {
               </div>
             </div>
             <div className="auto-story-note">
-              The complete set of story plans is built and checked before review. Source clips may overlap
-              between different narrative arcs. Transcription uses the backend GPU when available, otherwise CPU.
+              AI discovers the storylines first. You choose which ones to create; then the backend automatically
+              builds, checks, and renders them. Source clips may overlap between different narratives.
             </div>
             {settingsError && <p className="auto-story-error">{settingsError}</p>}
             {settings && !readyForStart && (
@@ -527,7 +575,7 @@ function AutoStory() {
             className="btn btn-primary"
             disabled={creating || uploading || !uploadFilename || !readyForStart}
           >
-            {creating ? <><span className="spinner"></span> Starting…</> : '✨ Plan my stories'}
+            {creating ? <><span className="spinner"></span> Starting…</> : '✨ Find storylines'}
           </button>
         </form>
       </div>
@@ -553,8 +601,8 @@ function AutoStory() {
         <div>
           <h2>Auto Story-Recipe</h2>
           <p>
-            {state.source_name || job.upload_filename} · {state.story_count || (state.recipe ? 1 : 4)} stories ·
-            {' '}about {state.target_duration_sec || 60} seconds each
+            {state.source_name || job.upload_filename} · about {state.target_duration_sec || 60} seconds per story
+            {state.story_count ? ` · ${state.story_count} storylines found` : ''}
           </p>
         </div>
         <div className="auto-story-header-actions">
@@ -586,28 +634,61 @@ function AutoStory() {
 
       {job.status === 'awaiting_storyline' && (
         <section className="auto-story-section">
-          <h3>Choose a storyline</h3>
-          <p className="auto-story-help">This job uses the earlier single-story workflow. Choose one arc to continue.</p>
+          <h3>Choose which stories to create</h3>
+          <p className="auto-story-help">
+            Select one or more storylines. All are selected initially; uncheck any you do not want.
+            After you continue, the backend automatically creates and renders the selected stories.
+          </p>
           <div className="auto-story-storylines">
             {state.storylines?.map((storyline, index) => (
               <article className="card auto-story-storyline" key={storyline.id}>
-                <span className="auto-story-kicker">Storyline {index + 1}</span>
+                <label className="auto-story-storyline-choice">
+                  <input
+                    type="checkbox"
+                    checked={selectedStorylineIds.includes(storyline.id)}
+                    onChange={() => toggleStoryline(storyline.id)}
+                    aria-label={`Select storyline ${index + 1}: ${storyline.title}`}
+                  />
+                  <span className="auto-story-kicker">Storyline {index + 1}</span>
+                </label>
                 <h4>{storyline.title}</h4>
                 <p>{storyline.summary}</p>
                 <div className="auto-story-meta">
                   <span>Characters: {storyline.key_characters?.join(', ') || 'Not specified'}</span>
                   <span>Speakers: {storyline.speaker_ids?.join(', ') || 'Not identified'}</span>
+                  <span>
+                    Episode span: {Math.floor(storyline.start_sec / 60)}:{String(Math.floor(storyline.start_sec % 60)).padStart(2, '0')}
+                    {' – '}
+                    {Math.floor(storyline.end_sec / 60)}:{String(Math.floor(storyline.end_sec % 60)).padStart(2, '0')}
+                  </span>
                 </div>
-                <button
-                  type="button"
-                  className="btn btn-primary"
-                  onClick={() => chooseStoryline(storyline.id)}
-                  disabled={selecting}
-                >
-                  {selecting ? 'Selecting beats…' : 'Build this storyline'}
-                </button>
               </article>
             ))}
+          </div>
+          {state.storylines?.length === 0 && (
+            <div className="auto-story-warning">
+              No storylines were found. Rerun discovery to ask the AI for a fresh set.
+            </div>
+          )}
+          <div className="auto-story-actions">
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={rerunStorylineDiscovery}
+              disabled={rediscovering || selecting}
+            >
+              {rediscovering ? <><span className="spinner"></span> Finding new storylines…</> : '🔄 Rerun story discovery'}
+            </button>
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={createSelectedStories}
+              disabled={!selectedStorylineIds.length || selecting || rediscovering}
+            >
+              {selecting
+                ? <><span className="spinner"></span> Creating stories…</>
+                : `✅ Create & render ${selectedStorylineIds.length} ${selectedStorylineIds.length === 1 ? 'story' : 'stories'}`}
+            </button>
           </div>
         </section>
       )}

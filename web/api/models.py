@@ -158,7 +158,9 @@ class AutoStoryCreateRequest(BaseModel):
     upload_filename: str = Field(..., description="Filename returned by /api/upload")
     source_name: str = Field("Episode", min_length=1, max_length=180)
     target_duration_sec: int = Field(60, ge=60, le=120)
-    story_count: int = Field(4, ge=4, le=5)
+    story_count: Optional[int] = Field(
+        None, ge=1, le=8, description="Legacy field; story count is discovered by AI."
+    )
     ai_provider: AIProvider = AIProvider.GEMINI
 
     @field_validator("upload_filename")
@@ -171,6 +173,16 @@ class AutoStoryCreateRequest(BaseModel):
 
 class AutoStorylineSelectionRequest(BaseModel):
     storyline_id: str = Field(..., min_length=1, max_length=80)
+
+
+class AutoStorySelectionRequest(BaseModel):
+    storyline_ids: list[str] = Field(..., min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def reject_duplicate_storylines(self) -> "AutoStorySelectionRequest":
+        if len(set(self.storyline_ids)) != len(self.storyline_ids):
+            raise ValueError("Selected storylines must be unique.")
+        return self
 
 
 class AutoStoryStoryRecipeRequest(BaseModel):

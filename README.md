@@ -47,14 +47,14 @@
 | **Podcast Split-Screen** | Auto speaker diarization via **Pyannote** with top-bottom split-screen layout for podcasts (9:16). Supports **3+ speakers across multiple scenes** with per-speaker frozen frame fallback |
 | **Podcast Camera Switch** | Auto active-speaker detection with scene-aware switching — full 9:16 crop focuses on whoever is talking; blurred pillarbox only when speakers in the same scene talk simultaneously (9:16) |
 | **AI Voice-Over** | Converts auto-clips into original commentary/reaction videos using **Gemini** (script generation) and **edge-tts** (free text-to-speech), complete with audio ducking, text override, and ambient edge glow |
-| **Auto Story-Recipe** | Plans and validates four or five distinct dialogue stories from one episode, then renders each as a separate montage with karaoke captions and manifests |
+| **Auto Story-Recipe** | Discovers the episode's possible dialogue stories, lets you choose which to create, then automatically renders each with karaoke captions and manifests |
 
 > 🎬 **NEW: Story Clip Mode (`--story-mode`)**  
 > Need to assemble a narrative from multiple specific video sources (like a brand campaign)? We've just introduced the Multi-Source Story Clip Mode!  
 > 👉 **[Read the full Story Clip Documentation](docs/STORY_CLIP.md)**
 
 > 🎞️ **Auto Story-Recipe (`--auto-story-mode`)**
-> Select one episode storyline, review/edit its dialogue beats, then approve an editor-ready montage.
+> Discover the supported episode storylines, choose which to create, then let Auto Story build and render them.
 > 👉 **[Read the Auto Story-Recipe guide](docs/AUTO_STORY_RECIPE.md)**
 
 ## 📋 Prerequisites
@@ -185,7 +185,7 @@ $env:VITE_API_PROXY_TARGET = "http://127.0.0.1:8000"
 npm --prefix web\dashboard run dev -- --host 127.0.0.1
 ```
 
-Open `http://127.0.0.1:5173`. The dashboard uses `npm run dev` (Vite); this project does not define an `npm start` script. To create multiple story montages without CLI commands, choose **Auto Story** in the sidebar and review the complete generated plan before approving all renders. See the [Auto Story-Recipe dashboard guide](docs/AUTO_STORY_RECIPE.md#use-from-the-local-studio-dashboard). Add your Gemini API key in the dashboard's **Settings** before creating clipping jobs. API keys are stored in the repository's git-ignored `.env` file; their values stay masked in the dashboard, and a **Set** label confirms a saved key. On a machine without a usable GPU, the dashboard defaults to Whisper `small` on **CPU** with `int8`, disables CUDA/Auto, and the API refuses CUDA jobs before they start. The default proxy target (`http://backend:8000`) is for Docker Compose; the dashboard command above sets the local API proxy.
+Open `http://127.0.0.1:5173`. The dashboard uses `npm run dev` (Vite); this project does not define an `npm start` script. To create multiple story montages without CLI commands, choose **Auto Story** in the sidebar, select the storylines AI discovers, and let the backend create and render them automatically. See the [Auto Story-Recipe dashboard guide](docs/AUTO_STORY_RECIPE.md#use-from-the-local-studio-dashboard). Add your Gemini API key in the dashboard's **Settings** before creating clipping jobs. API keys are stored in the repository's git-ignored `.env` file; their values stay masked in the dashboard, and a **Set** label confirms a saved key. On a machine without a usable GPU, the dashboard defaults to Whisper `small` on **CPU** with `int8`, disables CUDA/Auto, and the API refuses CUDA jobs before they start. The default proxy target (`http://backend:8000`) is for Docker Compose; the dashboard command above sets the local API proxy.
 
 To run **Auto Story** on Kaggle's GPU instead of your local machine, start the Kaggle backend and use the local dashboard as its frontend; see the [Kaggle Auto Story instructions](docs/AUTO_STORY_RECIPE.md#use-the-local-auto-story-dashboard). Do not start the local API for that setup.
 

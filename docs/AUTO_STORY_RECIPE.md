@@ -1,23 +1,20 @@
 # Auto Story-Recipe Mode
 
 Auto Story-Recipe creates editor-ready dialogue montages from **one episode
-source**. The Studio plans four or five distinct narrative arcs, schedules and
-validates every story before review, then renders each approved story to its own
-video. The CLI remains a single-story workflow. Source moments may be reused
-between different stories. Auto Story does not generate voice-over or upload
-videos.
+source**. The Studio asks AI to discover as many distinct narrative arcs as the
+episode supports (up to eight), lets you choose which arcs to create, then
+automatically schedules, validates, and renders each selected story separately.
+The CLI remains a single-story workflow. Source moments may be reused between
+different stories. Auto Story does not generate voice-over or upload videos.
 
-The Studio workflow is staged so rendering cannot begin without reviewing the
-complete plan:
+The Studio asks for a story selection once, after discovery:
 
 1. Faster-Whisper creates word timestamps and PyAnnote adds speaker IDs.
-2. The selected AI provider proposes four or five distinct storylines.
-3. The provider selects dialogue beats for every storyline. The automatic
-   scheduler checks beat lengths, source-time gaps, episode span, and runtime
-   before showing all stories together.
-4. Review the full plan, optionally adjust word-boundary timings, or reconstruct
-   one story while preserving the other stories. Validate edits to the full plan.
-5. Approve once to render the stories sequentially as separate videos.
+2. The selected AI provider discovers the distinct storylines the transcript
+   supports. If you want another set, rerun discovery before continuing.
+3. Select one or more storylines and continue. The backend builds and validates
+   every selected story, requests fresh dialogue candidates when a schedule
+   cannot fit, and renders the stories sequentially without further approval.
 
 The CLI still requires choosing one of three storylines, reviewing its recipe
 JSON, and explicitly approving the single montage.
@@ -71,21 +68,19 @@ Start the local API and Vite dashboard using the two-terminal commands in the
 Open `http://127.0.0.1:5173`, select **Auto Story** in the sidebar, and:
 
 1. Choose and upload one episode video.
-2. Choose four or five stories, a 60-, 90-, or 120-second target **per story**,
-   and the AI provider.
-3. Wait for transcription, storyline discovery, and automatic scheduling of
-   every story. The dashboard progress bar follows transcript audio progress;
-   speaker identification is a separate step and can take time.
-4. Review all narrative arcs and their dialogue beats together. Each schedule
-   is prevalidated for beat length, source gaps, episode span, and target
-   runtime. Use **Reconstruct story** on one story to replace only that arc, or
-   adjust its word-boundary timings.
-5. If you edited timings, select **Check the full plan**. Then select
-   **Approve & render all stories** once. The backend renders each montage
-   sequentially and provides a separate MP4, caption sidecar, manifest, and
-   reviewed recipe for each story, plus a combined plan manifest.
+2. Choose a 60-, 90-, or 120-second target **per story** and the AI provider.
+3. Wait for transcription and story discovery. The dashboard progress bar
+   follows transcript audio progress; speaker identification is a separate step.
+4. Select the storylines you want. All discovered arcs are selected initially;
+   uncheck any you do not want. Choose **Rerun story discovery** for a fresh set,
+   or **Create & render** to build the selected stories.
+5. After selection, the backend automatically creates, validates, and renders
+   each story. It retries beat-candidate generation up to three times when a
+   candidate pool cannot meet the timing, spacing, span, or runtime constraints.
+   The results include a separate MP4, caption sidecar, and manifest for each
+   story, plus a combined plan manifest.
 
-The page can be refreshed during processing or review; the dashboard job state
+The page can be refreshed during processing or story selection; the dashboard job state
 and cached transcript remain on the local backend. Auto Story uses the existing
 dashboard upload limit of 2 GB. Configure the selected provider key and
 `HF_TOKEN` in **Settings** first. The backend automatically selects CUDA when
@@ -129,20 +124,21 @@ Use `--target-duration 90` or `120` for a longer montage. The default output
 folder is `outputs/auto_story_recipe/<source-id>/`. Use
 `--auto-story-output-dir` to change its parent.
 
-## Review and output
+## CLI review and dashboard output
 
-The storyline list is saved as `storyline_discovery.json`. Beat selection
-creates `story_recipe_review_<cache-key>.json`; edit the dialogue start/end
-times to cached word boundaries, or add/remove beats, while the CLI waits for
-review. The validator derives the displayed dialogue and speaker IDs from the
-cached transcript, so changes to free-form text do not change the source audio.
-Invalid recipes are rejected with specific reasons; edit the same file and
-rerun. Cached transcription, diarization, and AI responses are reused when
-their source/model/settings keys still match.
+The storyline list is saved as `storyline_discovery.json`. In the CLI, beat
+selection creates `story_recipe_review_<cache-key>.json`; edit the dialogue
+start/end times to cached word boundaries, or add/remove beats, while the CLI
+waits for review. The validator derives displayed dialogue and speaker IDs from
+the cached transcript, so changes to free-form text do not change the source
+audio. Invalid recipes are rejected with specific reasons; edit the same file
+and rerun. Cached transcription, diarization, and AI responses are reused when
+their source/model/settings keys still match. The dashboard automatically
+creates and validates selected stories and does not ask users to review beats.
 The combined word-and-speaker transcript is stored at
 `outputs/story_cache/auto_story/<source-id>/combined_transcript.json`.
 
-After approval, the dashboard output folder contains:
+After rendering, the dashboard output folder contains:
 
 - `story-1_<title>_story_montage.mp4` (and one corresponding file set per story)
   — rendered dialogue montage with karaoke captions, unless `--no-subs` was
@@ -151,7 +147,8 @@ After approval, the dashboard output folder contains:
   use.
 - `story-1_<title>_manifest.json` — storyline summary, source/dialogue
   timestamps, transcript word IDs, speaker IDs, clip padding, and output paths.
-- `story-1_recipe_review_<cache-key>.json` — the editable reviewed recipe.
+- `story-1_recipe_<cache-key>.json` — the generated recipe manifest for the
+  selected story.
 - `story_plan_manifest.json` — the full set of stories and output files.
 
 The CLI continues to write one `story_montage.mp4`, one ASS sidecar, and one
@@ -174,15 +171,15 @@ The CLI continues to write one `story_montage.mp4`, one ASS sidecar, and one
   shorter source span, the same ratio is applied to that arc's span. These
   checks are configurable with `--min-gap-sec` and
   `--min-episode-span-ratio`.
-- Scene-boundary detection, active-speaker cropping, Demucs, TTS, and automatic
-  retries for invalid AI schedules are not part of v1. In the Studio, use
-  **Reconstruct story** for a fresh alternative; in the CLI, correct the review
-  JSON and rerun. Existing cached responses avoid repeated provider calls
-  unless reconstruction is requested.
+- Scene-boundary detection, active-speaker cropping, Demucs, and TTS are not
+  part of v1. The Studio retries beat-candidate generation up to three times;
+  if the selected story still cannot satisfy the constraints, the job reports
+  the failed story instead of rendering an invalid montage.
 
 The CLI's two AI passes call only the provider chosen with `--ai-provider`.
-The Studio makes one storyline-discovery request and one beat-planning request
-per story; reconstructing a story makes a fresh discovery and beat-planning
-request for that replacement. Results are cached by transcript, prompt version,
-model, selected storyline, and recipe settings. Tests mock transcription,
-diarization, rendering, and AI; running the test suite does not use API credits.
+The Studio makes one storyline-discovery request and one or more beat-planning
+requests per selected story (up to three candidate rounds). Rerunning discovery
+makes a fresh discovery request. Results are cached by transcript, prompt
+version, model, selected storyline, candidate round, and recipe settings. Tests
+mock transcription, diarization, rendering, and AI; running the test suite does
+not use API credits.

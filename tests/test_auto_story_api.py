@@ -81,7 +81,7 @@ def test_auto_story_create_uploads_job_and_queues_discovery(api, monkeypatch):
     assert job["upload_filename"] == "uploaded_episode.mp4"
     assert job["auto_story"]["phase"] == "queued"
     assert job["auto_story"]["target_duration_sec"] == 90
-    assert job["auto_story"]["story_count"] == 4
+    assert job["auto_story"]["story_count"] == 0
     saved_config = store.get_job(job["id"])["config"]
     assert saved_config["auto_story_whisper_device"] == "cpu"
     assert saved_config["auto_story_whisper_compute_type"] == "int8"
@@ -105,6 +105,71 @@ def test_auto_story_uses_cuda_when_available(api, monkeypatch):
     saved_config = store.get_job(response.json()["id"])["config"]
     assert saved_config["auto_story_whisper_device"] == "cuda"
     assert saved_config["auto_story_whisper_compute_type"] == "float16"
+
+
+def test_storyline_selection_and_rediscovery_are_available_after_discovery(api, monkeypatch):
+    client, _ = api
+    storylines = [
+        {"id": f"arc-{index}", "title": f"Story {index}"}
+        for index in range(1, 4)
+    ]
+    job_ids = []
+    for revision in (2, 0):
+        job_id = store.create_job(
+            upload_filename="uploaded_episode.mp4",
+            source="local",
+            config={"auto_story_mode": True},
+        )
+        store.update_job(
+            job_id,
+            auto_story={
+                "phase": "awaiting_storyline",
+                "storylines": storylines,
+                "story_count": len(storylines),
+                "discovery_revision": revision,
+            },
+            status=JobStatus.AWAITING_STORYLINE.value,
+        )
+        job_ids.append(job_id)
+
+    selected = []
+    rediscovered = []
+
+    async def fake_select(job_id, storyline_ids):
+        selected.append((job_id, storyline_ids))
+
+    async def fake_rediscover(job_id):
+        rediscovered.append(job_id)
+
+    monkeypatch.setattr(
+        auto_story_worker, "submit_storyline_selection", fake_select
+    )
+    monkeypatch.setattr(
+        auto_story_worker, "submit_rediscovery", fake_rediscover
+    )
+
+    selection_response = client.post(
+        f"/api/auto-story/{job_ids[0]}/storylines/select",
+        json={"storyline_ids": ["arc-1", "arc-3"]},
+    )
+    assert selection_response.status_code == 200, selection_response.text
+    assert selection_response.json()["status"] == JobStatus.ANALYZING.value
+    assert (
+        selection_response.json()["auto_story"]["selected_storyline_ids"]
+        == ["arc-1", "arc-3"]
+    )
+    assert selected == [(job_ids[0], ["arc-1", "arc-3"])]
+
+    rediscovery_response = client.post(
+        f"/api/auto-story/{job_ids[1]}/storylines/rediscover"
+    )
+    assert rediscovery_response.status_code == 200, rediscovery_response.text
+    assert rediscovery_response.json()["status"] == JobStatus.ANALYZING.value
+    assert (
+        rediscovery_response.json()["auto_story"]["discovery_revision"] == 1
+    )
+    assert rediscovery_response.json()["auto_story"]["storylines"] == []
+    assert rediscovered == [job_ids[1]]
 
 
 def test_auto_story_worker_preserves_selected_whisper_settings(monkeypatch):
@@ -462,23 +527,13 @@ def test_discovery_stage_publishes_storylines_without_blocking_api(api, monkeypa
     monkeypatch.setattr(
         pipeline, "_load_or_create_transcript", fake_transcription
     )
-    monkeypatch.setattr(
-        pipeline, "_discover_storylines", lambda *_args, **_kwargs: storylines
-    )
-    monkeypatch.setattr(
-        auto_story_worker,
-        "_create_story_plan",
-        lambda state, _context, arc, story_id: {
-            "story_id": story_id,
-            "storyline": arc,
-            "recipe": {"beats": []},
-            "validation": {
-                "beat_count": 8,
-                "estimated_runtime_sec": 60.0,
-                "episode_span_sec": 300.0,
-            },
-        },
-    )
+    discovery_options = {}
+
+    def fake_discover(*_args, **kwargs):
+        discovery_options.update(kwargs)
+        return storylines
+
+    monkeypatch.setattr(pipeline, "_discover_storylines", fake_discover)
 
     async def run_inline(_job_id, function, *args):
         return function(*args)
@@ -489,15 +544,148 @@ def test_discovery_stage_publishes_storylines_without_blocking_api(api, monkeypa
     ))
 
     job = store.get_job(job_id)
-    assert job["status"] == JobStatus.AWAITING_RECIPE.value
+    assert job["status"] == JobStatus.AWAITING_STORYLINE.value
     assert job["auto_story"]["storylines"] == storylines
-    assert [story["story_id"] for story in job["auto_story"]["stories"]] == [
-        "story-1", "story-2", "story-3", "story-4",
-    ]
-    assert job["auto_story"]["validation"]["valid_story_count"] == 4
+    assert job["auto_story"]["stories"] == []
+    assert job["auto_story"]["story_count"] == 4
+    assert "Choose which ones to create" in job["auto_story"]["message"]
+    assert discovery_options["count"] is None
     assert job["auto_story"]["transcript_key"] == "key"
     assert 25.0 in progress_updates
     assert 45 in progress_updates
+
+
+def test_story_plan_retries_distinct_candidate_rounds(api, monkeypatch, tmp_path):
+    _, _ = api
+    cfg = SimpleNamespace(
+        auto_story_target_duration=60,
+        auto_story_min_beat_sec=3.5,
+        auto_story_max_beat_sec=6.0,
+        auto_story_min_gap_sec=30.0,
+        auto_story_min_episode_span_ratio=0.4,
+        auto_story_padding_sec=0.18,
+        auto_story_crossfade_ms=60,
+    )
+    state = {
+        "source_id": "episode-test",
+        "source_duration_sec": 3600.0,
+        "transcript_key": "transcript-key",
+    }
+    context = {
+        "cfg": cfg,
+        "auto_cache_dir": str(tmp_path / "cache"),
+        "output_dir": str(tmp_path / "outputs"),
+    }
+    monkeypatch.setattr(
+        auto_story_worker, "_load_words", lambda _state: [{"word_id": "W1"}]
+    )
+    candidate_rounds = []
+
+    def select_beats(*_args, candidate_round):
+        candidate_rounds.append(candidate_round)
+        if candidate_round < 2:
+            raise ValueError("No valid schedule from these candidates.")
+        return {"beats": []}, "cache-key"
+
+    accepted_beat = {
+        "start_word_id": "W1",
+        "end_word_id": "W2",
+        "dialogue_start_sec": 1.0,
+        "dialogue_end_sec": 5.0,
+        "text": "A complete sentence.",
+        "speaker_ids": ["SPEAKER_00"],
+    }
+    monkeypatch.setattr(pipeline, "_select_beats", select_beats)
+    monkeypatch.setattr(
+        pipeline, "_build_review_recipe",
+        lambda *_args: {"beats": [{"beat_id": 1}]},
+    )
+    monkeypatch.setattr(
+        pipeline, "validate_review_recipe",
+        lambda *_args: {
+            "beats": [accepted_beat],
+            "estimated_runtime_sec": 60.0,
+            "episode_span_sec": 300.0,
+        },
+    )
+    monkeypatch.setattr(pipeline, "_write_json", lambda *_args: None)
+    monkeypatch.setattr(
+        pipeline, "_build_review_timing_options", lambda *_args: {}
+    )
+
+    story = auto_story_worker._create_story_plan(
+        state,
+        context,
+        {"id": "arc-1", "title": "A supported story"},
+        "story-1",
+    )
+
+    assert candidate_rounds == [0, 1, 2]
+    assert story["validation"]["estimated_runtime_sec"] == 60.0
+
+
+def test_selected_storylines_are_planned_then_rendered_without_review(api, monkeypatch):
+    _, _ = api
+    storylines = [
+        {"id": f"arc-{index}", "title": f"Story {index}"}
+        for index in range(1, 4)
+    ]
+    job_id = store.create_job(
+        upload_filename="uploaded_episode.mp4",
+        source="local",
+        config={"auto_story_mode": True},
+    )
+    store.update_job(
+        job_id,
+        auto_story={
+            "source_id": "episode-test",
+            "source_duration_sec": 3600.0,
+            "transcript_key": "transcript-key",
+            "storylines": storylines,
+        },
+    )
+    monkeypatch.setattr(
+        auto_story_worker, "_source_context",
+        lambda _job: {"cfg": SimpleNamespace()},
+    )
+    created = []
+
+    def create_plan(_state, _context, arc, story_id):
+        created.append((arc["id"], story_id))
+        return {
+            "story_id": story_id,
+            "storyline": arc,
+            "recipe": {"beats": []},
+            "validation": {"estimated_runtime_sec": 60.0},
+        }
+
+    rendered = []
+
+    def render_stories(_job_id, _job, state):
+        rendered.extend(state["stories"])
+        return {"stories": state["stories"], "output_files": ["story.mp4"]}
+
+    async def run_inline(_job_id, function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(auto_story_worker, "_create_story_plan", create_plan)
+    monkeypatch.setattr(
+        auto_story_worker, "_render_stories_sync", render_stories
+    )
+    monkeypatch.setattr(worker, "run_serialized_call", run_inline)
+
+    asyncio.run(auto_story_worker._run_stage(
+        job_id,
+        "generation",
+        auto_story_worker._create_selected_stories_sync,
+        ["arc-1", "arc-3"],
+    ))
+
+    assert created == [("arc-1", "story-1"), ("arc-3", "story-2")]
+    assert [story["story_id"] for story in rendered] == ["story-1", "story-2"]
+    assert store.get_job(job_id)["status"] == JobStatus.COMPLETED.value
+    assert store.get_job(job_id)["auto_story"]["phase"] == "completed"
+    assert store.get_job(job_id)["auto_story"]["output_files"] == ["story.mp4"]
 
 
 def test_complete_story_plan_validation_and_render_are_single_approval(api, monkeypatch):

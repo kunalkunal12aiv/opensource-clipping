@@ -1,3 +1,4 @@
+import json
 import re
 import sys
 from pathlib import Path
@@ -439,6 +440,65 @@ def test_storyline_validation_supports_multi_story_count_and_rejects_duplicate_a
     duplicated["storylines"][3]["title"] = duplicated["storylines"][0]["title"]
     with pytest.raises(ValueError, match="repeats an existing storyline"):
         auto_story._validate_storylines(duplicated, words, expected_count=4)
+
+
+def test_storyline_discovery_accepts_variable_count_and_saves_actual_count(
+    monkeypatch, tmp_path
+):
+    words = [
+        {
+            "word_id": f"W{index}",
+            "word": f"word{index}.",
+            "start": float(index),
+            "end": float(index) + 0.5,
+            "speaker_id": "SPEAKER_00",
+        }
+        for index in range(1, 4)
+    ]
+    response = {
+        "storylines": [
+            {
+                "id": f"arc_{index}",
+                "title": f"Arc {index}",
+                "summary": f"A setup {index}. A payoff {index}.",
+                "key_characters": [],
+                "source_ranges": [{
+                    "start_word_id": f"W{index}",
+                    "end_word_id": f"W{index}",
+                }],
+            }
+            for index in range(1, 3)
+        ],
+    }
+    prompts = []
+    monkeypatch.setattr(
+        auto_story, "_request_json",
+        lambda prompt, _schema, _cfg: prompts.append(prompt) or response,
+    )
+    cfg = SimpleNamespace(
+        ai_provider="gemini",
+        api_key_gemini="test-key",
+        gemini_model="test-model",
+        nvidia_model="test-model",
+    )
+    output_dir = tmp_path / "output"
+    storylines = auto_story._discover_storylines(
+        words,
+        100,
+        "transcript-key",
+        str(tmp_path / "cache"),
+        str(output_dir),
+        cfg,
+        count=None,
+    )
+
+    discovery_file = json.loads(
+        (output_dir / "storyline_discovery.json").read_text(encoding="utf-8")
+    )
+    assert len(storylines) == 2
+    assert discovery_file["story_count"] == 2
+    assert "as many strong, distinct" in prompts[0]
+    assert "up to eight" in prompts[0]
 
 
 def test_storyline_and_beat_ai_passes_reuse_cached_responses(monkeypatch, tmp_path):

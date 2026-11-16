@@ -11,7 +11,7 @@ import tempfile
 from collections.abc import Callable
 
 PROMPT_VERSION = "auto-story-recipe-v2-multi-story-planning"
-BEAT_PROMPT_VERSION = "auto-story-beats-v2"
+BEAT_PROMPT_VERSION = "auto-story-beats-v3-retry-candidates"
 DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
 AI_TIMEOUT_SECONDS = 900
 WORD_BOUNDARY_TOLERANCE = 0.05
@@ -383,14 +383,18 @@ _BEATS_SCHEMA = {
 def _validate_storylines(
     response: dict,
     words: list[dict],
-    expected_count: int = 3,
+    expected_count: int | None = 3,
     excluded_storylines: list[dict] | None = None,
 ) -> list[dict]:
     arcs = response.get("storylines")
-    if not isinstance(arcs, list) or len(arcs) != expected_count:
+    if not isinstance(arcs, list):
+        raise ValueError("Storyline Discovery must return a storylines array.")
+    if expected_count is not None and len(arcs) != expected_count:
         raise ValueError(
             f"Storyline Discovery must return exactly {expected_count} storylines."
         )
+    if expected_count is None and len(arcs) > 8:
+        raise ValueError("Storyline Discovery may return at most eight storylines.")
     word_positions = {word["word_id"]: index for index, word in enumerate(words)}
     seen_arc_ids = set()
     seen_titles = set()
@@ -695,7 +699,7 @@ def _discover_storylines(
     output_dir: str,
     cfg,
     *,
-    count: int = 3,
+    count: int | None = 3,
     excluded_storylines: list[dict] | None = None,
     cache_variant: str = "initial",
     output_filename: str = "storyline_discovery.json",
@@ -726,9 +730,16 @@ def _discover_storylines(
     cache_path = os.path.join(cache_dir, f"storyline_discovery_{cache_key[:12]}.json")
     cached = _read_cache(cache_path, cache_key)
     if cached is None:
+        discovery_instruction = (
+            "Find as many strong, distinct, self-contained story arcs as the "
+            "transcript genuinely supports, up to eight. Return fewer when fewer "
+            "are supported; never pad the list with weak or duplicate arcs. Return "
+            "an empty storylines array if no coherent arc is supported."
+            if count is None
+            else f"Find exactly {count} distinct, self-contained story arcs."
+        )
         prompt = (
-            f"Find exactly {count} distinct, self-contained story arcs in this episode "
-            "transcript. Do not summarize the whole episode. The arcs must have "
+            f"{discovery_instruction} Do not summarize the whole episode. The arcs must have "
             "different central conflicts, character dynamics, or outcomes; their "
             "source ranges may overlap. For each arc, return a "
             "short title, exactly two concise summary sentences, key character names "
@@ -766,7 +777,7 @@ def _discover_storylines(
         os.path.join(output_dir, output_filename),
         {
             "source_duration_sec": duration,
-            "story_count": count,
+            "story_count": len(storylines),
             "storylines": storylines,
         },
     )
@@ -818,6 +829,8 @@ def _select_beats(
     transcript_key: str,
     cache_dir: str,
     cfg,
+    *,
+    candidate_round: int = 0,
 ) -> tuple[dict, str]:
     provider, model = _provider_model(cfg)
     settings = {
@@ -832,6 +845,7 @@ def _select_beats(
     cache_key = _digest({
         "prompt_version": BEAT_PROMPT_VERSION,
         "pass": 2,
+        "candidate_round": candidate_round,
         "transcript": transcript_key,
         "arc": arc,
         "settings": settings,
@@ -844,10 +858,17 @@ def _select_beats(
         min_count, max_count = _expected_beat_count_range(
             target, min_beat, max_beat, padding, crossfade
         )
-        min_candidates = max(min_count * 2, min_count + 4)
+        candidate_multiplier = 2 + candidate_round
+        min_candidates = max(
+            min_count * candidate_multiplier,
+            min_count + 4 + candidate_round * 4,
+        )
         max_candidates = max(
             min_candidates,
-            min(max_count * 2, min_candidates + 16),
+            min(
+                max_count * candidate_multiplier,
+                min_candidates + 16 + candidate_round * 8,
+            ),
         )
         prompt = (
             "Build a candidate pool of chronological dialogue-only beats that tell "
@@ -855,7 +876,7 @@ def _select_beats(
             'JSON object with a "beats" array containing between '
             f"{min_candidates} and {max_candidates} candidate beats. These are "
             "alternatives, not the final cut; a deterministic scheduler will select "
-            "a valid subset before review. Spread candidates across the full episode "
+            "a valid subset for automatic rendering. Spread candidates across the full episode "
             "span, include alternatives for every story phase, and avoid clustering "
             "all candidates around the same scene. Candidates may overlap or fall "
             "inside the minimum gap; the scheduler will resolve those conflicts. "
@@ -879,6 +900,14 @@ def _select_beats(
             "Eligible speaker-labeled transcript (ID|start-end seconds|speaker|word):\n"
             f"{_format_transcript(_select_arc_words(arc, words))}"
         )
+        if candidate_round:
+            prompt = (
+                "A previous candidate pool could not satisfy the automatic schedule. "
+                "Return a broader and more varied set of valid alternatives, focusing "
+                "on separate scenes across the selected arc and ensuring enough clips "
+                "can meet all timing and spacing constraints.\n\n"
+                + prompt
+            )
         response = _request_json(prompt, _BEATS_SCHEMA, cfg)
         cached = {"beats": response.get("beats")}
         _validate_beat_candidates(cached, arc, words)
