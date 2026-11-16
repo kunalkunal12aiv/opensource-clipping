@@ -71,6 +71,7 @@ async def create_auto_story(req: AutoStoryCreateRequest) -> JobResponse:
     config = {
         "auto_story_mode": True,
         "target_duration_sec": req.target_duration_sec,
+        "story_count": req.story_count,
         "ai_provider": provider,
         "source_name": req.source_name,
         "auto_story_whisper_model": "small",
@@ -87,8 +88,10 @@ async def create_auto_story(req: AutoStoryCreateRequest) -> JobResponse:
         auto_story={
             "phase": "queued",
             "target_duration_sec": req.target_duration_sec,
+            "story_count": req.story_count,
             "source_name": req.source_name,
             "storylines": [],
+            "stories": [],
             "recipe": None,
             "validation": None,
             "output_files": [],
@@ -155,25 +158,126 @@ async def validate_recipe(
     if job.get("status") != JobStatus.AWAITING_RECIPE.value:
         raise HTTPException(status_code=409, detail="This job is not waiting for recipe review.")
     state = dict(job.get("auto_story") or {})
-    state.update(
-        recipe=req.recipe,
-        validation=None,
-        phase="awaiting_recipe",
-        message="Checking the reviewed recipe.",
-    )
+    if req.stories is not None:
+        submitted_stories = [
+            item.model_dump(mode="json") for item in req.stories
+        ]
+        submitted_by_id = {
+            item["story_id"]: item["recipe"] for item in submitted_stories
+        }
+        state["stories"] = [
+            {
+                **story,
+                "recipe": submitted_by_id.get(story.get("story_id"), story.get("recipe")),
+            }
+            for story in state.get("stories", [])
+        ]
+        state.update(
+            validation=None,
+            phase="awaiting_recipe",
+            message="Checking every story in the plan.",
+        )
+    else:
+        submitted_stories = None
+        state.update(
+            recipe=req.recipe,
+            validation=None,
+            phase="awaiting_recipe",
+            message="Checking the reviewed recipe.",
+        )
     store.update_job(job_id, auto_story=state)
     try:
-        result = await auto_story_worker.validate_recipe(job_id, req.recipe)
+        if submitted_stories is not None:
+            result = await auto_story_worker.validate_stories(
+                job_id, submitted_stories
+            )
+        else:
+            result = await auto_story_worker.validate_recipe(
+                job_id, req.recipe
+            )
     except ValueError as exc:
-        state.update(message=f"Recipe needs changes: {exc}")
+        label = "Plan" if submitted_stories is not None else "Recipe"
+        state.update(message=f"{label} needs changes: {exc}")
         store.update_job(job_id, auto_story=state)
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except worker.JobCancelled as exc:
         raise HTTPException(status_code=409, detail="Auto Story has been cancelled.") from exc
 
     state = dict((store.get_job(job_id) or {}).get("auto_story") or {})
-    state.update(result, phase="awaiting_recipe", message="Recipe validated. Approve rendering when ready.")
+    state.update(
+        result,
+        phase="awaiting_recipe",
+        message=(
+            "Every story is valid. Review the complete plan and approve rendering."
+            if submitted_stories is not None
+            else "Recipe validated. Approve rendering when ready."
+        ),
+    )
     store.update_job(job_id, auto_story=state)
+    return _job_to_response(store.get_job(job_id))
+
+
+@router.post("/{job_id}/stories/{story_id}/reconstruct", response_model=JobResponse)
+async def reconstruct_story(job_id: str, story_id: str) -> JobResponse:
+    job = _require_auto_story_job(job_id)
+    if job.get("status") != JobStatus.AWAITING_RECIPE.value:
+        raise HTTPException(
+            status_code=409,
+            detail="Stories can only be reconstructed while reviewing the plan.",
+        )
+    state = dict(job.get("auto_story") or {})
+    stories = state.get("stories")
+    if not isinstance(stories, list) or not any(
+        item.get("story_id") == story_id for item in stories
+    ):
+        raise HTTPException(status_code=404, detail="Story not found in this plan.")
+    if not state.get("validation") or any(
+        not item.get("validation") for item in stories
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Validate the complete story plan before reconstructing a story.",
+        )
+
+    counts = dict(state.get("reconstruction_counts") or {})
+    revision = int(counts.get(story_id, 0)) + 1
+    counts[story_id] = revision
+    state.update(
+        reconstruction_counts=counts,
+        reconstructing_story_id=story_id,
+        phase="reconstructing",
+        message="Reconstructing one story; the other plans will be preserved.",
+    )
+    store.update_job(
+        job_id,
+        auto_story=state,
+        status=JobStatus.ANALYZING.value,
+        error=None,
+    )
+    store.update_progress(
+        job_id,
+        "story_reconstruction",
+        3,
+        4,
+        f"Reconstructing {story_id} without changing the other stories.",
+        70,
+    )
+    try:
+        await auto_story_worker.submit_reconstruction(
+            job_id, story_id, revision
+        )
+    except ValueError as exc:
+        state.pop("reconstructing_story_id", None)
+        state.update(
+            phase="awaiting_recipe",
+            message="The story could not be reconstructed.",
+        )
+        store.update_job(
+            job_id,
+            auto_story=state,
+            status=JobStatus.AWAITING_RECIPE.value,
+        )
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return _job_to_response(store.get_job(job_id))
 
 
@@ -181,21 +285,44 @@ async def validate_recipe(
 async def render_auto_story(job_id: str) -> JobResponse:
     job = _require_auto_story_job(job_id)
     state = job.get("auto_story") or {}
-    if (
-        job.get("status") != JobStatus.AWAITING_RECIPE.value
-        or not state.get("validation")
-    ):
+    has_story_plan = bool(state.get("stories"))
+    plan_is_valid = bool(state.get("validation"))
+    if has_story_plan:
+        plan_is_valid = plan_is_valid and all(
+            item.get("validation") for item in state["stories"]
+        )
+    if job.get("status") != JobStatus.AWAITING_RECIPE.value or not plan_is_valid:
         raise HTTPException(
             status_code=409,
-            detail="Validate the reviewed recipe before approving rendering.",
+            detail=(
+                "Validate the complete story plan before approving rendering."
+                if has_story_plan
+                else "Validate the reviewed recipe before approving rendering."
+            ),
         )
     state = dict(state)
-    state.update(phase="rendering", message="Rendering the approved montage.")
+    state.update(
+        phase="rendering",
+        message=(
+            "Rendering all approved stories."
+            if has_story_plan
+            else "Rendering the approved montage."
+        ),
+    )
     store.update_job(
         job_id, auto_story=state, status=JobStatus.RENDERING.value
     )
     store.update_progress(
-        job_id, "render", 4, 4, "Rendering the approved montage and captions.", 85
+        job_id,
+        "render",
+        4,
+        4,
+        (
+            "Rendering each approved story and its captions."
+            if has_story_plan
+            else "Rendering the approved montage and captions."
+        ),
+        85,
     )
     try:
         await auto_story_worker.submit_render(job_id)

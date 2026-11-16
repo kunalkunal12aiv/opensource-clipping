@@ -62,6 +62,21 @@ export async function validateAutoStoryRecipe(jobId, recipe) {
   })
 }
 
+export async function validateAutoStoryPlan(jobId, stories) {
+  return autoStoryRequest(`/${encodeURIComponent(jobId)}/recipe`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ stories }),
+  })
+}
+
+export async function reconstructAutoStoryStory(jobId, storyId) {
+  return autoStoryRequest(
+    `/${encodeURIComponent(jobId)}/stories/${encodeURIComponent(storyId)}/reconstruct`,
+    { method: 'POST' },
+  )
+}
+
 export async function renderAutoStory(jobId) {
   return autoStoryRequest(`/${encodeURIComponent(jobId)}/render`, {
     method: 'POST',

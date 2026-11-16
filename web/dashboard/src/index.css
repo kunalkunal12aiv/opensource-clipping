@@ -826,6 +826,27 @@ html, body {
   gap: 14px;
 }
 
+.auto-story-plan-list {
+  display: grid;
+  gap: 16px;
+}
+
+.auto-story-plan-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.auto-story-storyline .auto-story-plan-heading .btn {
+  flex: 0 0 auto;
+  margin-top: 0;
+}
+
+.auto-story-result {
+  margin-bottom: 16px;
+}
+
 .auto-story-storyline h4 {
   font-size: 16px;
   margin: 8px 0;
@@ -937,5 +958,9 @@ html, body {
 @media (max-width: 768px) {
   .auto-story-beat {
     grid-template-columns: 1fr;
+  }
+
+  .auto-story-plan-heading {
+    flex-direction: column;
   }
 }

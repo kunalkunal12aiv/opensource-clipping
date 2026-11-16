@@ -81,6 +81,7 @@ def test_auto_story_create_uploads_job_and_queues_discovery(api, monkeypatch):
     assert job["upload_filename"] == "uploaded_episode.mp4"
     assert job["auto_story"]["phase"] == "queued"
     assert job["auto_story"]["target_duration_sec"] == 90
+    assert job["auto_story"]["story_count"] == 4
     saved_config = store.get_job(job["id"])["config"]
     assert saved_config["auto_story_whisper_device"] == "cpu"
     assert saved_config["auto_story_whisper_compute_type"] == "int8"
@@ -305,6 +306,107 @@ def test_recipe_validation_saves_exact_cached_boundaries_and_dialogue(api, monke
     assert saved == result["recipe"]
 
 
+def test_storyline_selection_prevalidates_the_scheduled_recipe(api, monkeypatch):
+    _, tmp_path = api
+    job_id = store.create_job(
+        upload_filename="uploaded_episode.mp4",
+        source="local",
+        config={"auto_story_mode": True},
+    )
+    words = [
+        {
+            "word_id": "W000001",
+            "word": "Here",
+            "start": 10.0,
+            "end": 10.2,
+            "speaker_id": "SPEAKER_00",
+        },
+        {
+            "word_id": "W000002",
+            "word": "we are.",
+            "start": 13.8,
+            "end": 14.2,
+            "speaker_id": "SPEAKER_00",
+        },
+    ]
+    storyline = {
+        "id": "arc-1",
+        "source_ranges": [{
+            "start_word_id": "W000001",
+            "end_word_id": "W000002",
+            "start_sec": 10.0,
+            "end_sec": 14.2,
+        }],
+    }
+    store.update_job(
+        job_id,
+        auto_story={
+            "source_id": "episode-test",
+            "source_duration_sec": 600.0,
+            "transcript_key": "transcript-key",
+            "storylines": [storyline],
+        },
+    )
+    cfg = SimpleNamespace(
+        auto_story_target_duration=60,
+        auto_story_min_beat_sec=3.5,
+        auto_story_max_beat_sec=6.0,
+        auto_story_min_gap_sec=30,
+        auto_story_min_episode_span_ratio=0.4,
+        auto_story_padding_sec=0.18,
+        auto_story_crossfade_ms=60,
+    )
+    monkeypatch.setattr(
+        auto_story_worker,
+        "_source_context",
+        lambda _job: {
+            "cfg": cfg,
+            "auto_cache_dir": str(tmp_path / "cache"),
+            "output_dir": str(tmp_path / "outputs"),
+        },
+    )
+    monkeypatch.setattr(auto_story_worker, "_load_words", lambda _state: words)
+    monkeypatch.setattr(
+        pipeline,
+        "_select_beats",
+        lambda *_args: ({
+            "beats": [{
+                "start_word_id": "W000001",
+                "end_word_id": "W000002",
+                "narrative_role": "hook",
+                "reason": "Opens the story.",
+            }],
+        }, "cache-key"),
+    )
+    accepted_beat = {
+        "start_word_id": "W000001",
+        "end_word_id": "W000002",
+        "dialogue_start_sec": 10.0,
+        "dialogue_end_sec": 14.2,
+        "text": "Here we are.",
+        "speaker_ids": ["SPEAKER_00"],
+    }
+    monkeypatch.setattr(
+        pipeline,
+        "validate_review_recipe",
+        lambda *_args: {
+            "beats": [accepted_beat],
+            "estimated_runtime_sec": 4.56,
+            "episode_span_sec": 4.56,
+        },
+    )
+
+    result = auto_story_worker._select_beats_sync(job_id, "arc-1")
+
+    assert result["validation"] == {
+        "beat_count": 1,
+        "estimated_runtime_sec": 4.56,
+        "episode_span_sec": 4.56,
+    }
+    assert result["recipe"]["beats"][0]["dialogue_end_sec"] == 14.2
+    assert (tmp_path / "outputs" / result["recipe_filename"]).is_file()
+
+
 def test_discovery_stage_publishes_storylines_without_blocking_api(api, monkeypatch):
     _, _ = api
     job_id = store.create_job(
@@ -314,22 +416,28 @@ def test_discovery_stage_publishes_storylines_without_blocking_api(api, monkeypa
     )
     store.update_job(job_id, auto_story={"phase": "queued"})
     context = {
-        "cfg": object(),
+        "cfg": SimpleNamespace(
+            auto_story_target_duration=60,
+            auto_story_min_gap_sec=30.0,
+        ),
         "source_id": "episode-test",
         "source": {"name": "Episode one"},
         "video_path": "uploaded_episode.mp4",
         "auto_cache_dir": "cache",
         "output_dir": "output",
     }
-    storylines = [{
-        "id": "arc-1",
-        "title": "A story",
-        "summary": "A beginning. A payoff.",
-        "key_characters": [],
-        "speaker_ids": [],
-        "start_sec": 1.0,
-        "end_sec": 300.0,
-    }]
+    storylines = [
+        {
+            "id": f"arc-{index}",
+            "title": f"Story {index}",
+            "summary": f"A beginning {index}. A payoff {index}.",
+            "key_characters": [],
+            "speaker_ids": [],
+            "start_sec": 1.0,
+            "end_sec": 300.0,
+        }
+        for index in range(1, 5)
+    ]
     monkeypatch.setattr(auto_story_worker, "_source_context", lambda _job: context)
     monkeypatch.setattr(pipeline, "_provider_model", lambda _cfg: ("gemini", "model"))
     monkeypatch.setattr(pipeline, "_probe_duration", lambda _path: 3600.0)
@@ -355,7 +463,21 @@ def test_discovery_stage_publishes_storylines_without_blocking_api(api, monkeypa
         pipeline, "_load_or_create_transcript", fake_transcription
     )
     monkeypatch.setattr(
-        pipeline, "_discover_storylines", lambda *_args: storylines
+        pipeline, "_discover_storylines", lambda *_args, **_kwargs: storylines
+    )
+    monkeypatch.setattr(
+        auto_story_worker,
+        "_create_story_plan",
+        lambda state, _context, arc, story_id: {
+            "story_id": story_id,
+            "storyline": arc,
+            "recipe": {"beats": []},
+            "validation": {
+                "beat_count": 8,
+                "estimated_runtime_sec": 60.0,
+                "episode_span_sec": 300.0,
+            },
+        },
     )
 
     async def run_inline(_job_id, function, *args):
@@ -367,8 +489,372 @@ def test_discovery_stage_publishes_storylines_without_blocking_api(api, monkeypa
     ))
 
     job = store.get_job(job_id)
-    assert job["status"] == JobStatus.AWAITING_STORYLINE.value
+    assert job["status"] == JobStatus.AWAITING_RECIPE.value
     assert job["auto_story"]["storylines"] == storylines
+    assert [story["story_id"] for story in job["auto_story"]["stories"]] == [
+        "story-1", "story-2", "story-3", "story-4",
+    ]
+    assert job["auto_story"]["validation"]["valid_story_count"] == 4
     assert job["auto_story"]["transcript_key"] == "key"
     assert 25.0 in progress_updates
     assert 45 in progress_updates
+
+
+def test_complete_story_plan_validation_and_render_are_single_approval(api, monkeypatch):
+    client, _ = api
+    job_id = store.create_job(
+        upload_filename="uploaded_episode.mp4",
+        source="local",
+        config={"auto_story_mode": True},
+    )
+    stories = [
+        {
+            "story_id": f"story-{index}",
+            "storyline": {"id": f"arc-{index}", "title": f"Story {index}"},
+            "recipe": {"beats": []},
+            "recipe_filename": f"story-{index}.json",
+            "validation": {"beat_count": 8, "estimated_runtime_sec": 60.0},
+        }
+        for index in range(1, 5)
+    ]
+    store.update_job(
+        job_id,
+        auto_story={
+            "phase": "awaiting_recipe",
+            "stories": stories,
+            "validation": {"valid_story_count": 4},
+        },
+        status=JobStatus.AWAITING_RECIPE.value,
+    )
+    submitted = []
+    render_submissions = []
+
+    async def fake_validate(_job_id, submitted_stories):
+        submitted.extend(submitted_stories)
+        return {
+            "stories": stories,
+            "validation": {
+                "story_count": 4,
+                "valid_story_count": 4,
+                "estimated_runtime_sec": 240.0,
+            },
+        }
+
+    async def fake_render(_job_id):
+        render_submissions.append(_job_id)
+
+    monkeypatch.setattr(auto_story_worker, "validate_stories", fake_validate)
+    monkeypatch.setattr(auto_story_worker, "submit_render", fake_render)
+
+    response = client.put(
+        f"/api/auto-story/{job_id}/recipe",
+        json={
+            "stories": [
+                {"story_id": story["story_id"], "recipe": story["recipe"]}
+                for story in stories
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert len(submitted) == 4
+    assert response.json()["auto_story"]["validation"]["valid_story_count"] == 4
+
+    rendered = client.post(f"/api/auto-story/{job_id}/render")
+    assert rendered.status_code == 200, rendered.text
+    assert render_submissions == [job_id]
+
+
+def test_reconstruct_story_only_targets_a_story_in_the_reviewed_plan(api, monkeypatch):
+    client, _ = api
+    job_id = store.create_job(
+        upload_filename="uploaded_episode.mp4",
+        source="local",
+        config={"auto_story_mode": True},
+    )
+    stories = [
+        {
+            "story_id": f"story-{index}",
+            "storyline": {"id": f"arc-{index}", "title": f"Story {index}"},
+            "validation": {"estimated_runtime_sec": 60.0},
+        }
+        for index in range(1, 5)
+    ]
+    store.update_job(
+        job_id,
+        auto_story={
+            "phase": "awaiting_recipe",
+            "stories": stories,
+            "validation": {"valid_story_count": 4},
+            "reconstruction_counts": {},
+        },
+        status=JobStatus.AWAITING_RECIPE.value,
+    )
+    submitted = []
+
+    async def fake_reconstruct(_job_id, story_id, revision):
+        submitted.append((story_id, revision))
+
+    monkeypatch.setattr(
+        auto_story_worker, "submit_reconstruction", fake_reconstruct
+    )
+
+    missing = client.post(
+        f"/api/auto-story/{job_id}/stories/not-in-plan/reconstruct"
+    )
+    assert missing.status_code == 404
+
+    response = client.post(
+        f"/api/auto-story/{job_id}/stories/story-3/reconstruct"
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == JobStatus.ANALYZING.value
+    assert response.json()["auto_story"]["reconstruction_counts"]["story-3"] == 1
+    assert submitted == [("story-3", 1)]
+
+
+def test_worker_validates_every_recipe_in_the_complete_plan(api, monkeypatch):
+    _, tmp_path = api
+    job_id = store.create_job(
+        upload_filename="uploaded_episode.mp4",
+        source="local",
+        config={"auto_story_mode": True},
+    )
+    stories = [
+        {
+            "story_id": f"story-{index}",
+            "storyline": {"id": f"arc-{index}", "title": f"Story {index}"},
+            "recipe": {
+                "source_id": "episode-test",
+                "storyline": {"id": f"arc-{index}"},
+                "beats": [{"beat_id": 1}],
+            },
+            "recipe_filename": f"story-{index}.json",
+            "validation": {"estimated_runtime_sec": 60.0},
+        }
+        for index in range(1, 5)
+    ]
+    state = {
+        "source_id": "episode-test",
+        "source_duration_sec": 3600.0,
+        "stories": stories,
+    }
+    store.update_job(job_id, auto_story=state)
+    cfg = SimpleNamespace(
+        auto_story_target_duration=60,
+        auto_story_min_beat_sec=3.5,
+        auto_story_max_beat_sec=6.0,
+        auto_story_min_gap_sec=30.0,
+        auto_story_min_episode_span_ratio=0.4,
+        auto_story_padding_sec=0.18,
+        auto_story_crossfade_ms=60,
+    )
+    monkeypatch.setattr(
+        auto_story_worker,
+        "_source_context",
+        lambda _job: {"cfg": cfg, "output_dir": str(tmp_path)},
+    )
+    monkeypatch.setattr(auto_story_worker, "_load_words", lambda _state: [])
+    validated_ids = []
+
+    def fake_validate(recipe, arc, *_args):
+        validated_ids.append(arc["id"])
+        return {
+            "beats": [{
+                "start_word_id": "W1",
+                "end_word_id": "W2",
+                "dialogue_start_sec": 10.0,
+                "dialogue_end_sec": 14.0,
+                "text": arc["title"],
+                "speaker_ids": [],
+            }],
+            "estimated_runtime_sec": 60.0,
+            "episode_span_sec": 500.0,
+        }
+
+    monkeypatch.setattr(pipeline, "validate_review_recipe", fake_validate)
+    monkeypatch.setattr(
+        pipeline, "_build_review_timing_options", lambda *_args: {}
+    )
+
+    result = auto_story_worker._validate_stories_sync(
+        job_id,
+        [
+            {"story_id": story["story_id"], "recipe": story["recipe"]}
+            for story in stories
+        ],
+    )
+
+    assert validated_ids == [f"arc-{index}" for index in range(1, 5)]
+    assert result["validation"]["valid_story_count"] == 4
+    assert len(result["stories"]) == 4
+    assert all(
+        (tmp_path / story["recipe_filename"]).is_file()
+        for story in result["stories"]
+    )
+
+
+def test_story_span_requirement_scales_to_a_shorter_storyline(api):
+    cfg = SimpleNamespace(auto_story_min_episode_span_ratio=0.4)
+
+    ratio = auto_story_worker._story_span_ratio(
+        cfg,
+        {"start_sec": 1200.0, "end_sec": 1800.0},
+        3600.0,
+    )
+
+    assert ratio == pytest.approx(0.4 * 600 / 3600)
+    assert 3600 * ratio == pytest.approx(240.0)
+
+
+def test_reconstructing_one_story_preserves_the_other_plans(api, monkeypatch, tmp_path):
+    job_id = store.create_job(
+        upload_filename="uploaded_episode.mp4",
+        source="local",
+        config={"auto_story_mode": True},
+    )
+    stories = [
+        {
+            "story_id": f"story-{index}",
+            "storyline": {
+                "id": f"arc-{index}",
+                "title": f"Story {index}",
+                "source_ranges": [],
+            },
+            "recipe": {"beats": []},
+            "validation": {"estimated_runtime_sec": 60.0},
+        }
+        for index in range(1, 5)
+    ]
+    state = {
+        "source_id": "episode-test",
+        "source_duration_sec": 3600.0,
+        "transcript_key": "transcript-key",
+        "stories": stories,
+    }
+    store.update_job(job_id, auto_story=state)
+    context = {
+        "cfg": SimpleNamespace(
+            auto_story_target_duration=60,
+            auto_story_min_gap_sec=30.0,
+        ),
+        "auto_cache_dir": str(tmp_path / "cache"),
+        "output_dir": str(tmp_path / "outputs"),
+    }
+    monkeypatch.setattr(
+        auto_story_worker, "_source_context", lambda _job: context
+    )
+    monkeypatch.setattr(auto_story_worker, "_load_words", lambda _state: [])
+    discovery = {}
+
+    def fake_discover(*_args, **kwargs):
+        discovery.update(kwargs)
+        return [{
+            "id": "suggested-id",
+            "title": "Replacement story",
+            "summary": "A new setup. A different payoff.",
+            "source_ranges": [],
+        }]
+
+    monkeypatch.setattr(pipeline, "_discover_storylines", fake_discover)
+    monkeypatch.setattr(pipeline, "_write_json", lambda *_args: None)
+    monkeypatch.setattr(
+        auto_story_worker,
+        "_create_story_plan",
+        lambda _state, _context, arc, story_id: {
+            "story_id": story_id,
+            "storyline": arc,
+            "recipe": {"beats": []},
+            "validation": {"estimated_runtime_sec": 60.0},
+        },
+    )
+
+    result = auto_story_worker._reconstruct_story_sync(
+        job_id, "story-2", 1
+    )
+
+    assert [story["storyline"]["title"] for story in result["stories"]] == [
+        "Story 1", "Replacement story", "Story 3", "Story 4",
+    ]
+    assert result["stories"][1]["storyline"]["id"] == "story-2-reconstruction-1"
+    assert len(discovery["excluded_storylines"]) == 4
+    assert discovery["count"] == 1
+
+
+def test_multi_story_render_writes_distinct_flat_output_files(api, monkeypatch, tmp_path):
+    job_id = store.create_job(
+        upload_filename="uploaded_episode.mp4",
+        source="local",
+        config={"auto_story_mode": True},
+    )
+    stories = [
+        {
+            "story_id": f"story-{index}",
+            "storyline": {"id": f"arc-{index}", "title": f"Story {index}"},
+            "recipe": {"beats": []},
+            "recipe_filename": f"story-{index}_recipe.json",
+            "validation": {"estimated_runtime_sec": 60.0},
+        }
+        for index in range(1, 5)
+    ]
+    state = {
+        "source_id": "episode-test",
+        "source_name": "Episode",
+        "source_duration_sec": 3600.0,
+        "validation": {"valid_story_count": 4},
+        "stories": stories,
+    }
+    store.update_job(job_id, auto_story=state)
+    cfg = SimpleNamespace(
+        auto_story_target_duration=60,
+        auto_story_min_beat_sec=3.5,
+        auto_story_max_beat_sec=6.0,
+        auto_story_min_gap_sec=30.0,
+        auto_story_min_episode_span_ratio=0.4,
+        auto_story_padding_sec=0.18,
+        auto_story_crossfade_ms=60,
+    )
+    monkeypatch.setattr(
+        auto_story_worker,
+        "_source_context",
+        lambda _job: {
+            "cfg": cfg,
+            "source_registry": {},
+            "cache_dir": str(tmp_path / "cache"),
+            "output_dir": str(tmp_path / "outputs"),
+        },
+    )
+    monkeypatch.setattr(auto_story_worker, "_load_words", lambda _state: [])
+    monkeypatch.setattr(
+        pipeline,
+        "validate_review_recipe",
+        lambda _recipe, arc, *_args: {
+            "storyline": arc,
+            "target_duration_sec": 60,
+            "estimated_runtime_sec": 60.0,
+            "settings": {},
+            "beats": [],
+        },
+    )
+    prefixes = []
+
+    def fake_render(*_args, output_prefix=None):
+        prefixes.append(output_prefix)
+        return (
+            str(tmp_path / f"{output_prefix}_story_montage.mp4"),
+            str(tmp_path / f"{output_prefix}_story_montage.ass"),
+            60.0,
+        )
+
+    monkeypatch.setattr(pipeline, "_render_montage", fake_render)
+
+    result = auto_story_worker._render_stories_sync(
+        job_id, store.get_job(job_id), state
+    )
+
+    assert len(set(prefixes)) == 4
+    assert len([item for item in result["output_files"] if item["filename"].endswith(".mp4")]) == 4
+    assert result["output_files"][-1]["filename"] == "story_plan_manifest.json"
+    assert (tmp_path / "outputs" / "story_plan_manifest.json").is_file()
+    saved_state = store.get_job(job_id)["auto_story"]
+    assert saved_state["rendered_story_count"] == 4
+    assert len(saved_state["output_files"]) == len(result["output_files"]) - 1

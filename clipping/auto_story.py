@@ -10,7 +10,8 @@ import sys
 import tempfile
 from collections.abc import Callable
 
-PROMPT_VERSION = "auto-story-recipe-v1"
+PROMPT_VERSION = "auto-story-recipe-v2-multi-story-planning"
+BEAT_PROMPT_VERSION = "auto-story-beats-v2"
 DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
 AI_TIMEOUT_SECONDS = 900
 WORD_BOUNDARY_TOLERANCE = 0.05
@@ -380,13 +381,28 @@ _BEATS_SCHEMA = {
 
 
 def _validate_storylines(
-    response: dict, words: list[dict]
+    response: dict,
+    words: list[dict],
+    expected_count: int = 3,
+    excluded_storylines: list[dict] | None = None,
 ) -> list[dict]:
     arcs = response.get("storylines")
-    if not isinstance(arcs, list) or len(arcs) != 3:
-        raise ValueError("Storyline Discovery must return exactly three storylines.")
+    if not isinstance(arcs, list) or len(arcs) != expected_count:
+        raise ValueError(
+            f"Storyline Discovery must return exactly {expected_count} storylines."
+        )
     word_positions = {word["word_id"]: index for index, word in enumerate(words)}
     seen_arc_ids = set()
+    seen_titles = set()
+    seen_summaries = set()
+    excluded_titles = {
+        re.sub(r"\W+", " ", str(item.get("title", "")).casefold()).strip()
+        for item in excluded_storylines or []
+    }
+    excluded_summaries = {
+        re.sub(r"\W+", " ", str(item.get("summary", "")).casefold()).strip()
+        for item in excluded_storylines or []
+    }
     validated = []
     for arc in arcs:
         if not isinstance(arc, dict):
@@ -438,6 +454,19 @@ def _validate_storylines(
         summary = str(arc.get("summary", "")).strip()
         if not title or not summary:
             raise ValueError(f"Storyline {arc_id} must have a title and summary.")
+        title_key = re.sub(r"\W+", " ", title.casefold()).strip()
+        summary_key = re.sub(r"\W+", " ", summary.casefold()).strip()
+        if (
+            title_key in seen_titles
+            or title_key in excluded_titles
+            or summary_key in seen_summaries
+            or summary_key in excluded_summaries
+        ):
+            raise ValueError(
+                f"Storyline {arc_id} repeats an existing storyline."
+            )
+        seen_titles.add(title_key)
+        seen_summaries.add(summary_key)
         validated.append({
             "id": arc_id,
             "title": title,
@@ -485,6 +514,179 @@ def _validate_beat_candidates(response: dict, arc: dict, words: list[dict]) -> N
             raise ValueError(f"Beat #{index} is outside the selected storyline ranges.")
 
 
+def _schedule_beat_candidates(
+    response: dict,
+    arc: dict,
+    words: list[dict],
+    episode_duration: float,
+    target: float,
+    min_beat: float,
+    max_beat: float,
+    min_gap: float,
+    min_span_ratio: float,
+    padding: float,
+    crossfade: float,
+) -> dict:
+    positions = {word["word_id"]: index for index, word in enumerate(words)}
+    valid = []
+    seen = set()
+
+    for beat in response["beats"]:
+        start_index = positions[beat["start_word_id"]]
+        end_index = positions[beat["end_word_id"]]
+        start_word = words[start_index]
+        end_word = words[end_index]
+        duration = end_word["end"] - start_word["start"]
+        sentence_extension = (
+            duration <= min(6.5, max_beat + 0.5)
+            and _is_sentence_end(end_word["word"])
+        )
+        if duration < min_beat or (
+            duration > max_beat and not sentence_extension
+        ):
+            continue
+
+        identity = (beat["start_word_id"], beat["end_word_id"])
+        if identity in seen:
+            continue
+        seen.add(identity)
+        clip_start = max(0.0, start_word["start"] - padding)
+        clip_end = min(episode_duration, end_word["end"] + padding)
+        if clip_end <= clip_start:
+            continue
+
+        role = str(beat.get("narrative_role", "")).lower()
+        role_mask = 0
+        if "hook" in role:
+            role_mask |= 1
+        if "escal" in role:
+            role_mask |= 2
+        if "twist" in role or "payoff" in role:
+            role_mask |= 4
+        valid.append({
+            "beat": beat,
+            "start_index": start_index,
+            "clip_start": clip_start,
+            "clip_end": clip_end,
+            "clip_duration": clip_end - clip_start,
+            "role_mask": role_mask,
+        })
+
+    valid.sort(key=lambda item: (item["clip_start"], item["clip_end"]))
+    if len(valid) < 2:
+        raise ValueError(
+            "AI did not provide enough valid dialogue candidates to build a story."
+        )
+
+    required_span = episode_duration * min_span_ratio
+
+    def matching_pairs(first_pool, last_pool):
+        return [
+            (first, last)
+            for first in first_pool
+            for last in last_pool
+            if first["start_index"] < last["start_index"]
+            and last["clip_start"] - first["clip_end"] >= min_gap
+            and last["clip_end"] - first["clip_start"] >= required_span
+        ]
+
+    hook_candidates = [item for item in valid if item["role_mask"] & 1]
+    payoff_candidates = [item for item in valid if item["role_mask"] & 4]
+    pairs = matching_pairs(
+        hook_candidates or valid,
+        payoff_candidates or valid,
+    )
+    if not pairs:
+        pairs = matching_pairs(valid, valid)
+    if not pairs:
+        raise ValueError(
+            "AI dialogue candidates do not span enough of the episode with the "
+            f"required {min_gap:.1f}-second gaps. Choose another storyline."
+        )
+
+    first, last = max(
+        pairs,
+        key=lambda pair: (
+            (pair[0]["role_mask"] | pair[1]["role_mask"]).bit_count(),
+            pair[1]["clip_end"] - pair[0]["clip_start"],
+        ),
+    )
+
+    middle_candidates = [
+        item for item in valid
+        if item is not first
+        and item is not last
+        and item["clip_start"] - first["clip_end"] >= min_gap
+        and last["clip_start"] - item["clip_end"] >= min_gap
+    ]
+    middle_candidates.sort(key=lambda item: (item["clip_end"], item["clip_start"]))
+    compatible = []
+    previous_end = first["clip_end"]
+    for item in middle_candidates:
+        if item["clip_start"] - previous_end >= min_gap:
+            compatible.append(item)
+            previous_end = item["clip_end"]
+
+    min_count, max_count = _expected_beat_count_range(
+        target, min_beat, max_beat, padding, crossfade
+    )
+    min_count = max(2, min_count)
+    anchor_duration = first["clip_duration"] + last["clip_duration"]
+    anchor_roles = first["role_mask"] | last["role_mask"]
+    states = {
+        (2, round(anchor_duration * 10), anchor_roles): (anchor_duration, ())
+    }
+    upper_runtime = target * 1.1
+
+    for candidate_index, item in enumerate(compatible):
+        updated_states = dict(states)
+        for (count, _duration_bucket, roles), (duration_sum, chosen) in states.items():
+            if count >= max_count:
+                continue
+            next_count = count + 1
+            next_duration = duration_sum + item["clip_duration"]
+            runtime = next_duration - (next_count - 1) * crossfade
+            if runtime > upper_runtime:
+                continue
+            next_roles = roles | item["role_mask"]
+            key = (next_count, round(next_duration * 10), next_roles)
+            previous = updated_states.get(key)
+            if previous is None:
+                updated_states[key] = (next_duration, chosen + (candidate_index,))
+            else:
+                previous_runtime = previous[0] - (next_count - 1) * crossfade
+                if abs(runtime - target) < abs(previous_runtime - target):
+                    updated_states[key] = (next_duration, chosen + (candidate_index,))
+        states = updated_states
+
+    lower_runtime = target * 0.9
+    schedules = []
+    for (count, _duration_bucket, roles), (duration_sum, chosen) in states.items():
+        if not min_count <= count <= max_count:
+            continue
+        runtime = duration_sum - (count - 1) * crossfade
+        if lower_runtime <= runtime <= upper_runtime:
+            schedules.append((
+                (
+                    (roles).bit_count(),
+                    -abs(runtime - target),
+                    -abs(count - (min_count + max_count) / 2),
+                ),
+                [first, *(compatible[index] for index in chosen), last],
+            ))
+
+    if not schedules:
+        raise ValueError(
+            "AI dialogue candidates could not be scheduled to meet the target "
+            "runtime, beat duration, episode span, and source-time gap constraints. "
+            "Choose another storyline."
+        )
+
+    _, selected = max(schedules, key=lambda item: item[0])
+    selected.sort(key=lambda item: item["clip_start"])
+    return {"beats": [item["beat"] for item in selected]}
+
+
 def _discover_storylines(
     words: list[dict],
     duration: float,
@@ -492,11 +694,31 @@ def _discover_storylines(
     cache_dir: str,
     output_dir: str,
     cfg,
+    *,
+    count: int = 3,
+    excluded_storylines: list[dict] | None = None,
+    cache_variant: str = "initial",
+    output_filename: str = "storyline_discovery.json",
+    target_duration_sec: int | None = None,
+    min_gap_sec: float | None = None,
 ) -> list[dict]:
     provider, model = _provider_model(cfg)
+    exclusions = [
+        {
+            "id": item.get("id"),
+            "title": item.get("title"),
+            "summary": item.get("summary"),
+        }
+        for item in excluded_storylines or []
+    ]
     cache_key = _digest({
         "prompt_version": PROMPT_VERSION,
         "pass": 1,
+        "storyline_count": count,
+        "excluded_storylines": exclusions,
+        "cache_variant": cache_variant,
+        "target_duration_sec": target_duration_sec,
+        "min_gap_sec": min_gap_sec,
         "transcript": transcript_key,
         "provider": provider,
         "model": model,
@@ -505,26 +727,48 @@ def _discover_storylines(
     cached = _read_cache(cache_path, cache_key)
     if cached is None:
         prompt = (
-            "Find exactly three distinct, self-contained story arcs in this episode "
-            "transcript. Do not summarize the whole episode. For each arc, return a "
+            f"Find exactly {count} distinct, self-contained story arcs in this episode "
+            "transcript. Do not summarize the whole episode. The arcs must have "
+            "different central conflicts, character dynamics, or outcomes; their "
+            "source ranges may overlap. For each arc, return a "
             "short title, exactly two concise summary sentences, key character names "
             "that are explicitly supported by dialogue, and one or more chronological "
             "source_ranges. Each range must use exact start_word_id and end_word_id "
             "values copied from the transcript. Do not invent dialogue, IDs, names, "
             "or timestamps. Prefer arcs with a clear setup, escalation, and payoff.\n\n"
-            f"Episode duration: {duration:.3f} seconds.\n"
-            "Speaker-labeled word transcript (ID|start-end seconds|speaker|word):\n"
-            f"{_format_transcript(words)}"
+            + (
+                "Do not repeat or reframe these already-planned story arcs:\n"
+                f"{json.dumps(exclusions, ensure_ascii=False)}\n\n"
+                if exclusions else ""
+            )
+            + (
+                f"Each arc must contain enough distributed dialogue to support "
+                f"an approximately {target_duration_sec}-second montage, using "
+                f"{min_gap_sec:.1f}-second minimum source gaps between clips. "
+                "Prefer source ranges that span enough of the episode for the "
+                "scheduler to find distinct hook, escalation, and payoff beats.\n\n"
+                if target_duration_sec is not None and min_gap_sec is not None
+                else ""
+            )
+            + f"Episode duration: {duration:.3f} seconds.\n"
+            + "Speaker-labeled word transcript (ID|start-end seconds|speaker|word):\n"
+            + f"{_format_transcript(words)}"
         )
         response = _request_json(prompt, _STORYLINES_SCHEMA, cfg)
         cached = {"storylines": response.get("storylines")}
-        _validate_storylines(cached, words)
+        _validate_storylines(cached, words, count, excluded_storylines)
         _write_cache(cache_path, cache_key, cached)
 
-    storylines = _validate_storylines(cached, words)
+    storylines = _validate_storylines(
+        cached, words, count, excluded_storylines
+    )
     _write_json(
-        os.path.join(output_dir, "storyline_discovery.json"),
-        {"source_duration_sec": duration, "storylines": storylines},
+        os.path.join(output_dir, output_filename),
+        {
+            "source_duration_sec": duration,
+            "story_count": count,
+            "storylines": storylines,
+        },
     )
     return storylines
 
@@ -586,7 +830,7 @@ def _select_beats(
         "crossfade_sec": crossfade,
     }
     cache_key = _digest({
-        "prompt_version": PROMPT_VERSION,
+        "prompt_version": BEAT_PROMPT_VERSION,
         "pass": 2,
         "transcript": transcript_key,
         "arc": arc,
@@ -600,21 +844,33 @@ def _select_beats(
         min_count, max_count = _expected_beat_count_range(
             target, min_beat, max_beat, padding, crossfade
         )
+        min_candidates = max(min_count * 2, min_count + 4)
+        max_candidates = max(
+            min_candidates,
+            min(max_count * 2, min_candidates + 16),
+        )
         prompt = (
-            "Select chronological dialogue-only beats that tell the selected "
-            "storyline as Hook -> Escalation -> Twist/Payoff. Return one JSON object "
-            'with a "beats" array. Each beat must identify exact start_word_id and '
-            "end_word_id values from the provided transcript, and include a concise "
-            "narrative_role and reason. Use only a contiguous dialogue interval from "
-            "one supplied source range. Never invent or paraphrase source dialogue. "
-            "Choose enough beats for the target runtime; the estimated feasible count "
-            f"is {min_count}-{max_count}. Individual dialogue intervals should be "
+            "Build a candidate pool of chronological dialogue-only beats that tell "
+            "the selected storyline as Hook -> Escalation -> Twist/Payoff. Return one "
+            'JSON object with a "beats" array containing between '
+            f"{min_candidates} and {max_candidates} candidate beats. These are "
+            "alternatives, not the final cut; a deterministic scheduler will select "
+            "a valid subset before review. Spread candidates across the full episode "
+            "span, include alternatives for every story phase, and avoid clustering "
+            "all candidates around the same scene. Candidates may overlap or fall "
+            "inside the minimum gap; the scheduler will resolve those conflicts. "
+            "Each beat must identify exact "
+            "start_word_id and end_word_id values from the provided transcript, and "
+            "include a concise narrative_role and reason. Use only a contiguous "
+            "dialogue interval from one supplied source range. Never invent or "
+            "paraphrase source dialogue. The final montage needs "
+            f"{min_count}-{max_count} beats. Individual dialogue intervals should be "
             f"{min_beat:.2f}-{max_beat:.2f} seconds; a sentence may finish up to "
             "0.5 seconds beyond the maximum only if the final transcript word ends "
-            "with sentence punctuation, and never exceed 6.5 seconds. Keep all beats "
-            "chronological, with padded source clips at least "
-            f"{min_gap:.1f} seconds apart, and spread the first-to-last clip over at "
-            f"least {min_span_ratio:.0%} of the episode. After adding "
+            "with sentence punctuation, and never exceed 6.5 seconds. Return "
+            "candidates chronologically and ensure the pool covers at least "
+            f"{min_span_ratio:.0%} of the episode. The final scheduler enforces "
+            f"{min_gap:.1f}-second source gaps. After adding "
             f"{padding:.2f}s padding to each side and applying {crossfade:.2f}s "
             "crossfades, total runtime must be within 10% of the target.\n\n"
             f"Selected storyline:\n{json.dumps(arc, ensure_ascii=False)}\n"
@@ -628,7 +884,20 @@ def _select_beats(
         _validate_beat_candidates(cached, arc, words)
         _write_cache(cache_path, cache_key, cached)
     _validate_beat_candidates(cached, arc, words)
-    return cached, cache_key
+    scheduled = _schedule_beat_candidates(
+        cached,
+        arc,
+        words,
+        episode_duration,
+        target,
+        min_beat,
+        max_beat,
+        min_gap,
+        min_span_ratio,
+        padding,
+        crossfade,
+    )
+    return scheduled, cache_key
 
 
 def _build_review_recipe(
@@ -962,6 +1231,7 @@ def _render_montage(
     cache_dir: str,
     output_dir: str,
     cfg,
+    output_prefix: str | None = None,
 ) -> tuple[str, str, float]:
     from . import studio
     from .story import assembler
@@ -984,8 +1254,13 @@ def _render_montage(
             ],
         },
     }
-    output_path = os.path.join(output_dir, "story_montage.mp4")
-    captions_path = os.path.join(output_dir, "story_montage.ass")
+    filename_prefix = f"{output_prefix}_" if output_prefix else ""
+    output_path = os.path.join(
+        output_dir, f"{filename_prefix}story_montage.mp4"
+    )
+    captions_path = os.path.join(
+        output_dir, f"{filename_prefix}story_montage.ass"
+    )
     caption_segments, expected_runtime = _build_caption_segments(
         validated_recipe["beats"],
         words,

@@ -299,6 +299,148 @@ def test_review_timing_options_offer_exact_end_to_extend_short_beat():
     } in options["1"]["end"]
 
 
+def test_scheduler_repairs_clustered_candidates_before_review():
+    words = []
+    candidates = []
+    for group in range(16):
+        source_start = 100.0 + group * 50
+        first_id = f"W{len(words) + 1:06d}"
+        words.extend([
+            {
+                "word_id": first_id,
+                "word": f"dialogue{group}",
+                "start": source_start,
+                "end": source_start + 0.1,
+                "speaker_id": "SPEAKER_00",
+            },
+            {
+                "word_id": f"W{len(words) + 2:06d}",
+                "word": "alternate",
+                "start": source_start + 1,
+                "end": source_start + 1.1,
+                "speaker_id": "SPEAKER_00",
+            },
+            {
+                "word_id": f"W{len(words) + 3:06d}",
+                "word": "line.",
+                "start": source_start + 5,
+                "end": source_start + 5.1,
+                "speaker_id": "SPEAKER_00",
+            },
+            {
+                "word_id": f"W{len(words) + 4:06d}",
+                "word": "ending.",
+                "start": source_start + 6,
+                "end": source_start + 6.1,
+                "speaker_id": "SPEAKER_00",
+            },
+        ])
+        role = (
+            "hook" if group == 0
+            else "twist/payoff" if group == 15
+            else "escalation"
+        )
+        candidates.extend([
+            {
+                "start_word_id": first_id,
+                "end_word_id": f"W{len(words) - 1:06d}",
+                "narrative_role": role,
+                "reason": "Advances the story.",
+            },
+            {
+                "start_word_id": f"W{len(words) - 2:06d}",
+                "end_word_id": f"W{len(words):06d}",
+                "narrative_role": role,
+                "reason": "Alternative dialogue.",
+            },
+        ])
+
+    arc = {
+        "id": "arc_1",
+        "source_ranges": [{
+            "start_word_id": words[0]["word_id"],
+            "end_word_id": words[-1]["word_id"],
+        }],
+    }
+    scheduled = auto_story._schedule_beat_candidates(
+        {"beats": candidates},
+        arc,
+        words,
+        episode_duration=1000,
+        target=60,
+        min_beat=3.5,
+        max_beat=6,
+        min_gap=30,
+        min_span_ratio=0.4,
+        padding=0.18,
+        crossfade=0.06,
+    )
+    recipe = auto_story._build_review_recipe(
+        scheduled, arc, words, "episode", {"target_duration_sec": 60}
+    )
+    result = auto_story.validate_review_recipe(
+        recipe,
+        arc,
+        words,
+        "episode",
+        episode_duration=1000,
+        target_duration=60,
+        min_beat_sec=3.5,
+        max_beat_sec=6,
+        min_gap_sec=30,
+        min_episode_span_ratio=0.4,
+        padding_sec=0.18,
+        crossfade_sec=0.06,
+    )
+
+    assert 0.9 * 60 <= result["estimated_runtime_sec"] <= 1.1 * 60
+    assert result["episode_span_sec"] >= 400
+    assert all(
+        result["beats"][index]["clip_start_sec"]
+        - result["beats"][index - 1]["clip_end_sec"] >= 30
+        for index in range(1, len(result["beats"]))
+    )
+    assert {beat["narrative_role"] for beat in result["beats"]} >= {
+        "hook", "escalation", "twist/payoff",
+    }
+
+
+def test_storyline_validation_supports_multi_story_count_and_rejects_duplicate_arcs():
+    words = [
+        {
+            "word_id": f"W{index}",
+            "word": f"word{index}",
+            "start": float(index),
+            "end": float(index) + 0.5,
+            "speaker_id": "SPEAKER_00",
+        }
+        for index in range(1, 5)
+    ]
+    response = {
+        "storylines": [
+            {
+                "id": f"arc-{index}",
+                "title": f"Arc {index}",
+                "summary": f"Setup {index}. Payoff {index}.",
+                "key_characters": [],
+                "source_ranges": [{
+                    "start_word_id": f"W{index}",
+                    "end_word_id": f"W{index}",
+                }],
+            }
+            for index in range(1, 5)
+        ],
+    }
+
+    validated = auto_story._validate_storylines(response, words, expected_count=4)
+    assert len(validated) == 4
+
+    duplicated = {"storylines": [dict(item) for item in response["storylines"]]}
+    duplicated["storylines"][3]["title"] = duplicated["storylines"][0]["title"]
+    with pytest.raises(ValueError, match="repeats an existing storyline"):
+        auto_story._validate_storylines(duplicated, words, expected_count=4)
+
+
 def test_storyline_and_beat_ai_passes_reuse_cached_responses(monkeypatch, tmp_path):
     words = [
         {
@@ -320,7 +462,7 @@ def test_storyline_and_beat_ai_passes_reuse_cached_responses(monkeypatch, tmp_pa
                     {
                         "id": f"arc_{index}",
                         "title": f"Arc {index}",
-                        "summary": "A setup. A payoff.",
+                        "summary": f"A setup {index}. A payoff {index}.",
                         "key_characters": ["Alex"],
                         "source_ranges": [{
                             "start_word_id": f"W{index:06d}",
@@ -340,6 +482,10 @@ def test_storyline_and_beat_ai_passes_reuse_cached_responses(monkeypatch, tmp_pa
         }
 
     monkeypatch.setattr(auto_story, "_request_json", fake_request)
+    monkeypatch.setattr(
+        auto_story, "_schedule_beat_candidates",
+        lambda response, *_args, **_kwargs: response,
+    )
     cfg = SimpleNamespace(
         ai_provider="gemini",
         api_key_gemini="test-key",

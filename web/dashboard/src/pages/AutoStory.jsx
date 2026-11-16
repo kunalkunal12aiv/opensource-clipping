@@ -5,10 +5,12 @@ import {
   createAutoStory,
   fetchAutoStory,
   fetchSettings,
+  reconstructAutoStoryStory,
   renderAutoStory,
   selectAutoStoryline,
   uploadVideo,
   validateAutoStoryRecipe,
+  validateAutoStoryPlan,
 } from '../api'
 
 const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled']
@@ -17,24 +19,29 @@ function AutoStory() {
   const { jobId } = useParams()
   const navigate = useNavigate()
   const fileRef = useRef(null)
-  const recipeTouched = useRef(false)
+  const planTouched = useRef(false)
   const [settings, setSettings] = useState(null)
   const [settingsError, setSettingsError] = useState('')
   const [selectedFile, setSelectedFile] = useState(null)
   const [uploadFilename, setUploadFilename] = useState('')
   const [uploading, setUploading] = useState(false)
   const [targetDuration, setTargetDuration] = useState(60)
+  const [storyCount, setStoryCount] = useState(4)
   const [provider, setProvider] = useState('gemini')
   const [creating, setCreating] = useState(false)
   const [job, setJob] = useState(null)
-  const [recipe, setRecipe] = useState(null)
-  const [timingOptions, setTimingOptions] = useState(null)
+  const [stories, setStories] = useState([])
+  const [legacyRecipe, setLegacyRecipe] = useState(null)
+  const [legacyTimingOptions, setLegacyTimingOptions] = useState(null)
   const [validated, setValidated] = useState(false)
+  const [legacyValidated, setLegacyValidated] = useState(false)
   const [validating, setValidating] = useState(false)
   const [selecting, setSelecting] = useState(false)
+  const [reconstructingStoryId, setReconstructingStoryId] = useState('')
   const [rendering, setRendering] = useState(false)
   const [cancelling, setCancelling] = useState(false)
   const [error, setError] = useState('')
+  const legacyTouched = useRef(false)
 
   useEffect(() => {
     let active = true
@@ -60,10 +67,23 @@ function AutoStory() {
         const data = await fetchAutoStory(jobId)
         if (!active) return
         setJob(data)
-        if (data.auto_story?.recipe && !recipeTouched.current) {
-          setRecipe(data.auto_story.recipe)
-          setTimingOptions(data.auto_story.timing_options || null)
-          setValidated(Boolean(data.auto_story.validation))
+        if (data.auto_story?.stories?.length && !planTouched.current) {
+          setStories(data.auto_story.stories)
+          setValidated(Boolean(
+            data.auto_story.validation
+            && data.auto_story.stories.every(story => story.validation),
+          ))
+        }
+        if (data.auto_story?.recipe && !legacyTouched.current) {
+          setLegacyRecipe(data.auto_story.recipe)
+          setLegacyTimingOptions(data.auto_story.timing_options || null)
+          setLegacyValidated(Boolean(data.auto_story.validation))
+        }
+        if (
+          data.status === 'awaiting_recipe'
+          && data.auto_story?.phase !== 'reconstructing'
+        ) {
+          setReconstructingStoryId('')
         }
         if (!TERMINAL_STATUSES.includes(data.status)) {
           timeout = setTimeout(poll, 2000)
@@ -112,6 +132,7 @@ function AutoStory() {
         upload_filename: uploadFilename,
         source_name: selectedFile.name,
         target_duration_sec: Number(targetDuration),
+        story_count: Number(storyCount),
         ai_provider: provider,
       })
       navigate(`/auto-story/${created.id}`)
@@ -126,11 +147,12 @@ function AutoStory() {
     setSelecting(true)
     setError('')
     try {
-      setJob(await selectAutoStoryline(jobId, storylineId))
-      recipeTouched.current = false
-      setRecipe(null)
-      setTimingOptions(null)
-      setValidated(false)
+      const updated = await selectAutoStoryline(jobId, storylineId)
+      setJob(updated)
+      legacyTouched.current = false
+      setLegacyRecipe(null)
+      setLegacyTimingOptions(null)
+      setLegacyValidated(false)
     } catch (err) {
       setError(err.message)
     } finally {
@@ -138,32 +160,32 @@ function AutoStory() {
     }
   }
 
-  const editBeat = (index, key, value) => {
-    recipeTouched.current = true
-    setValidated(false)
+  const editLegacyBeat = (beatIndex, key, value) => {
+    legacyTouched.current = true
+    setLegacyValidated(false)
     setError('')
-    setRecipe(current => ({
+    setLegacyRecipe(current => ({
       ...current,
-      beats: current.beats.map((beat, beatIndex) =>
-        beatIndex === index ? { ...beat, [key]: value } : beat,
-      ),
+      beats: current.beats.map((beat, index) => (
+        index === beatIndex ? { ...beat, [key]: value } : beat
+      )),
     }))
   }
 
-  const getAdjacentBoundary = (beatIndex, key, direction) => {
-    const beat = recipe?.beats?.[beatIndex]
-    const options = timingOptions?.[String(beat?.beat_id ?? beatIndex + 1)]?.[key] || []
-    const currentTime = Number(beat?.[key === 'start' ? 'dialogue_start_sec' : 'dialogue_end_sec'])
+  const getLegacyAdjacentBoundary = (beatIndex, key, direction) => {
+    const beat = legacyRecipe?.beats?.[beatIndex]
+    const options = legacyTimingOptions?.[String(beat?.beat_id ?? beatIndex + 1)]?.[key] || []
+    const field = key === 'start' ? 'dialogue_start_sec' : 'dialogue_end_sec'
+    const currentTime = Number(beat?.[field])
     if (!Number.isFinite(currentTime)) return null
-
     const candidates = options.filter(option => (
       direction < 0 ? option.time_sec < currentTime - 0.005 : option.time_sec > currentTime + 0.005
     ))
     return direction < 0 ? candidates[candidates.length - 1] || null : candidates[0] || null
   }
 
-  const getBoundaryWord = (beat, beatIndex, key) => {
-    const options = timingOptions?.[String(beat.beat_id ?? beatIndex + 1)]?.[key] || []
+  const getLegacyBoundaryWord = (beat, beatIndex, key) => {
+    const options = legacyTimingOptions?.[String(beat.beat_id ?? beatIndex + 1)]?.[key] || []
     const field = key === 'start' ? 'dialogue_start_sec' : 'dialogue_end_sec'
     const currentTime = Number(beat[field])
     if (!Number.isFinite(currentTime)) return null
@@ -175,12 +197,117 @@ function AutoStory() {
     return nearest && Math.abs(nearest.time_sec - currentTime) <= 0.05 ? nearest.word : null
   }
 
-  const moveBeatBoundary = (beatIndex, key, direction) => {
-    const next = getAdjacentBoundary(beatIndex, key, direction)
+  const moveLegacyBoundary = (beatIndex, key, direction) => {
+    const beat = legacyRecipe?.beats?.[beatIndex]
+    const next = getLegacyAdjacentBoundary(beatIndex, key, direction)
+    if (!beat || !next) return
+    const options = legacyTimingOptions?.[String(beat.beat_id ?? beatIndex + 1)]?.[key] || []
+    const idField = key === 'start' ? 'start_word_id' : 'end_word_id'
+    const currentIndex = options.findIndex(option => option.word_id === beat[idField])
+    const nextIndex = options.findIndex(option => option.word_id === next.word_id)
+    let textWords = String(beat.text || '').split(/\s+/).filter(Boolean)
+
+    if (currentIndex >= 0 && nextIndex >= 0) {
+      if (key === 'start' && nextIndex < currentIndex) {
+        textWords = [...options.slice(nextIndex, currentIndex).map(option => option.word), ...textWords]
+      } else if (key === 'start' && nextIndex > currentIndex) {
+        textWords = textWords.slice(nextIndex - currentIndex)
+      } else if (key === 'end' && nextIndex > currentIndex) {
+        textWords = [...textWords, ...options.slice(currentIndex + 1, nextIndex + 1).map(option => option.word)]
+      } else if (key === 'end' && nextIndex < currentIndex) {
+        textWords = textWords.slice(0, Math.max(0, textWords.length - (currentIndex - nextIndex)))
+      }
+    }
+    const field = key === 'start' ? 'dialogue_start_sec' : 'dialogue_end_sec'
+    legacyTouched.current = true
+    setLegacyValidated(false)
+    setError('')
+    setLegacyRecipe(current => ({
+      ...current,
+      beats: current.beats.map((item, index) => (
+        index === beatIndex
+          ? {
+            ...item,
+            [field]: next.time_sec,
+            [idField]: next.word_id,
+            text: textWords.join(' '),
+          }
+          : item
+      )),
+    }))
+  }
+
+  const validateLegacyRecipe = async () => {
+    setValidating(true)
+    setError('')
+    try {
+      const updated = await validateAutoStoryRecipe(jobId, legacyRecipe)
+      setJob(updated)
+      setLegacyRecipe(updated.auto_story.recipe)
+      legacyTouched.current = false
+      setLegacyValidated(true)
+    } catch (err) {
+      setError(err.message)
+      setLegacyValidated(false)
+    } finally {
+      setValidating(false)
+    }
+  }
+
+  const editBeat = (storyIndex, beatIndex, key, value) => {
+    planTouched.current = true
+    setValidated(false)
+    setError('')
+    setStories(current => current.map((story, index) => (
+      index === storyIndex
+        ? {
+          ...story,
+          recipe: {
+            ...story.recipe,
+            beats: story.recipe.beats.map((beat, currentBeatIndex) => (
+              currentBeatIndex === beatIndex ? { ...beat, [key]: value } : beat
+            )),
+          },
+        }
+        : story
+    )))
+  }
+
+  const getAdjacentBoundary = (storyIndex, beatIndex, key, direction) => {
+    const story = stories[storyIndex]
+    const beat = story?.recipe?.beats?.[beatIndex]
+    const options = story?.timing_options?.[String(beat?.beat_id ?? beatIndex + 1)]?.[key] || []
+    const currentTime = Number(beat?.[key === 'start' ? 'dialogue_start_sec' : 'dialogue_end_sec'])
+    if (!Number.isFinite(currentTime)) return null
+
+    const candidates = options.filter(option => (
+      direction < 0 ? option.time_sec < currentTime - 0.005 : option.time_sec > currentTime + 0.005
+    ))
+    return direction < 0 ? candidates[candidates.length - 1] || null : candidates[0] || null
+  }
+
+  const getBoundaryWord = (storyIndex, beat, beatIndex, key) => {
+    const options = stories[storyIndex]?.timing_options?.[
+      String(beat.beat_id ?? beatIndex + 1)
+    ]?.[key] || []
+    const field = key === 'start' ? 'dialogue_start_sec' : 'dialogue_end_sec'
+    const currentTime = Number(beat[field])
+    if (!Number.isFinite(currentTime)) return null
+    const nearest = options.reduce((best, option) => (
+      !best || Math.abs(option.time_sec - currentTime) < Math.abs(best.time_sec - currentTime)
+        ? option
+        : best
+    ), null)
+    return nearest && Math.abs(nearest.time_sec - currentTime) <= 0.05 ? nearest.word : null
+  }
+
+  const moveBeatBoundary = (storyIndex, beatIndex, key, direction) => {
+    const story = stories[storyIndex]
+    const next = getAdjacentBoundary(storyIndex, beatIndex, key, direction)
     if (!next) return
 
-    const beat = recipe.beats[beatIndex]
-    const options = timingOptions?.[String(beat.beat_id ?? beatIndex + 1)]?.[key] || []
+    const beat = story.recipe.beats[beatIndex]
+    const options = story.timing_options?.[String(beat.beat_id ?? beatIndex + 1)]?.[key] || []
     const idField = key === 'start' ? 'start_word_id' : 'end_word_id'
     const currentIndex = options.findIndex(option => option.word_id === beat[idField])
     const nextIndex = options.findIndex(option => option.word_id === next.word_id)
@@ -205,38 +332,63 @@ function AutoStory() {
     }
 
     const field = key === 'start' ? 'dialogue_start_sec' : 'dialogue_end_sec'
-    recipeTouched.current = true
+    planTouched.current = true
     setValidated(false)
     setError('')
-    setRecipe(current => ({
-      ...current,
-      beats: current.beats.map((item, index) => (
-        index === beatIndex
-          ? {
-            ...item,
-            [field]: next.time_sec,
-            [idField]: next.word_id,
-            text: textWords.join(' '),
-          }
-          : item
-      )),
-    }))
+    setStories(current => current.map((item, index) => (
+      index === storyIndex
+        ? {
+          ...item,
+          recipe: {
+            ...item.recipe,
+            beats: item.recipe.beats.map((currentBeat, currentBeatIndex) => (
+              currentBeatIndex === beatIndex
+                ? {
+                  ...currentBeat,
+                  [field]: next.time_sec,
+                  [idField]: next.word_id,
+                  text: textWords.join(' '),
+                }
+                : currentBeat
+            )),
+          },
+        }
+        : item
+    )))
   }
 
-  const validateRecipe = async () => {
+  const validatePlan = async () => {
     setValidating(true)
     setError('')
     try {
-      const updated = await validateAutoStoryRecipe(jobId, recipe)
+      const submittedStories = stories.map(({ story_id, recipe }) => ({
+        story_id,
+        recipe,
+      }))
+      const updated = await validateAutoStoryPlan(jobId, submittedStories)
       setJob(updated)
-      setRecipe(updated.auto_story.recipe)
-      recipeTouched.current = false
+      setStories(updated.auto_story.stories)
+      planTouched.current = false
       setValidated(true)
     } catch (err) {
       setError(err.message)
       setValidated(false)
     } finally {
       setValidating(false)
+    }
+  }
+
+  const reconstructStory = async (storyId) => {
+    setReconstructingStoryId(storyId)
+    setError('')
+    try {
+      const updated = await reconstructAutoStoryStory(jobId, storyId)
+      setJob(updated)
+      planTouched.current = false
+      setValidated(Boolean(updated.auto_story?.validation))
+    } catch (err) {
+      setError(err.message)
+      setReconstructingStoryId('')
     }
   }
 
@@ -313,10 +465,22 @@ function AutoStory() {
           </div>
 
           <div className="card auto-story-card">
-            <h3 className="card-title">2. Set your montage length</h3>
+            <h3 className="card-title">2. Plan your story set</h3>
             <div className="auto-story-options">
               <div className="form-group">
-                <label className="form-label" htmlFor="auto-story-duration">Target duration</label>
+                <label className="form-label" htmlFor="auto-story-count">Number of stories</label>
+                <select
+                  id="auto-story-count"
+                  className="form-select"
+                  value={storyCount}
+                  onChange={event => setStoryCount(event.target.value)}
+                >
+                  <option value={4}>4 independent story arcs</option>
+                  <option value={5}>5 independent story arcs</option>
+                </select>
+              </div>
+              <div className="form-group">
+                <label className="form-label" htmlFor="auto-story-duration">Target duration per story</label>
                 <select
                   id="auto-story-duration"
                   className="form-select"
@@ -342,8 +506,8 @@ function AutoStory() {
               </div>
             </div>
             <div className="auto-story-note">
-              Transcription uses the local CPU with Whisper small. Auto Story makes two AI requests
-              (storylines and dialogue beats); results are cached and invalid results are not retried automatically.
+              The complete set of story plans is built and checked before review. Source clips may overlap
+              between different narrative arcs. Transcription uses the backend GPU when available, otherwise CPU.
             </div>
             {settingsError && <p className="auto-story-error">{settingsError}</p>}
             {settings && !readyForStart && (
@@ -363,7 +527,7 @@ function AutoStory() {
             className="btn btn-primary"
             disabled={creating || uploading || !uploadFilename || !readyForStart}
           >
-            {creating ? <><span className="spinner"></span> Starting…</> : '✨ Find storylines'}
+            {creating ? <><span className="spinner"></span> Starting…</> : '✨ Plan my stories'}
           </button>
         </form>
       </div>
@@ -388,7 +552,10 @@ function AutoStory() {
       <div className="page-header">
         <div>
           <h2>Auto Story-Recipe</h2>
-          <p>{state.source_name || job.upload_filename} · About {state.target_duration_sec || 60} seconds</p>
+          <p>
+            {state.source_name || job.upload_filename} · {state.story_count || (state.recipe ? 1 : 4)} stories ·
+            {' '}about {state.target_duration_sec || 60} seconds each
+          </p>
         </div>
         <div className="auto-story-header-actions">
           <span className={`badge badge-${job.status}`}>{job.status.replace(/_/g, ' ')}</span>
@@ -419,8 +586,8 @@ function AutoStory() {
 
       {job.status === 'awaiting_storyline' && (
         <section className="auto-story-section">
-          <h3>3. Choose the storyline</h3>
-          <p className="auto-story-help">Pick the arc you want the montage to tell. The AI will then select dialogue beats from that storyline.</p>
+          <h3>Choose a storyline</h3>
+          <p className="auto-story-help">This job uses the earlier single-story workflow. Choose one arc to continue.</p>
           <div className="auto-story-storylines">
             {state.storylines?.map((storyline, index) => (
               <article className="card auto-story-storyline" key={storyline.id}>
@@ -430,7 +597,6 @@ function AutoStory() {
                 <div className="auto-story-meta">
                   <span>Characters: {storyline.key_characters?.join(', ') || 'Not specified'}</span>
                   <span>Speakers: {storyline.speaker_ids?.join(', ') || 'Not identified'}</span>
-                  <span>Episode span: {Math.floor(storyline.start_sec / 60)}:{String(Math.floor(storyline.start_sec % 60)).padStart(2, '0')} – {Math.floor(storyline.end_sec / 60)}:{String(Math.floor(storyline.end_sec % 60)).padStart(2, '0')}</span>
                 </div>
                 <button
                   type="button"
@@ -446,23 +612,21 @@ function AutoStory() {
         </section>
       )}
 
-      {job.status === 'awaiting_recipe' && recipe && (
+      {job.status === 'awaiting_recipe' && !state.stories?.length && legacyRecipe && (
         <section className="auto-story-section">
-          <h3>4. Review the dialogue beats</h3>
+          <h3>Review the dialogue beats</h3>
           <p className="auto-story-help">
-            Adjust the start/end times if needed. Use the word buttons to move to exact transcript boundaries: Start adds/removes words on the left; End removes/adds words on the right. Validation checks pacing and total length before rendering.
+            This job uses the earlier single-story workflow. Its schedule was prechecked; timing changes need a new validation.
           </p>
           <div className="auto-story-beats">
-            {recipe.beats?.map((beat, index) => (
-              <article className="card auto-story-beat" key={beat.beat_id || index}>
-                <div className="auto-story-beat-heading">
-                  <div>
-                    <span className="auto-story-kicker">Beat {index + 1} · {beat.narrative_role || 'Dialogue'}</span>
-                    <p className="auto-story-dialogue">“{beat.text}”</p>
-                    <span className="auto-story-meta-text">
-                      Speaker: {beat.speaker_ids?.join(', ') || 'Not identified'}
-                    </span>
-                  </div>
+            {legacyRecipe.beats?.map((beat, beatIndex) => (
+              <article className="card auto-story-beat" key={beat.beat_id || beatIndex}>
+                <div>
+                  <span className="auto-story-kicker">Beat {beatIndex + 1} · {beat.narrative_role || 'Dialogue'}</span>
+                  <p className="auto-story-dialogue">“{beat.text}”</p>
+                  <span className="auto-story-meta-text">
+                    Speaker: {beat.speaker_ids?.join(', ') || 'Not identified'}
+                  </span>
                 </div>
                 <div className="auto-story-time-fields">
                   {[
@@ -476,28 +640,28 @@ function AutoStory() {
                         type="number"
                         step="0.01"
                         value={beat[field]}
-                        onChange={event => editBeat(index, field, event.target.value)}
+                        onChange={event => editLegacyBeat(beatIndex, field, event.target.value)}
                       />
-                      {timingOptions?.[String(beat.beat_id ?? index + 1)]?.[key] && (
+                      {legacyTimingOptions?.[String(beat.beat_id ?? beatIndex + 1)]?.[key] && (
                         <span className="auto-story-word-controls">
                           <button
                             type="button"
                             className="btn btn-ghost btn-sm"
-                            onClick={() => moveBeatBoundary(index, key, -1)}
-                            disabled={!getAdjacentBoundary(index, key, -1)}
-                            aria-label={`Move beat ${index + 1} ${key} boundary one word earlier`}
+                            onClick={() => moveLegacyBoundary(beatIndex, key, -1)}
+                            disabled={!getLegacyAdjacentBoundary(beatIndex, key, -1)}
+                            aria-label={`Move beat ${beatIndex + 1} ${key} boundary one word earlier`}
                           >
                             {key === 'start' ? '← Add word' : '← Remove word'}
                           </button>
-                          <span className="auto-story-boundary-word" title={getBoundaryWord(beat, index, key) || 'Time is not on a cached word boundary'}>
-                            {getBoundaryWord(beat, index, key) || 'Custom time'}
+                          <span className="auto-story-boundary-word">
+                            {getLegacyBoundaryWord(beat, beatIndex, key) || 'Custom time'}
                           </span>
                           <button
                             type="button"
                             className="btn btn-ghost btn-sm"
-                            onClick={() => moveBeatBoundary(index, key, 1)}
-                            disabled={!getAdjacentBoundary(index, key, 1)}
-                            aria-label={`Move beat ${index + 1} ${key} boundary one word later`}
+                            onClick={() => moveLegacyBoundary(beatIndex, key, 1)}
+                            disabled={!getLegacyAdjacentBoundary(beatIndex, key, 1)}
+                            aria-label={`Move beat ${beatIndex + 1} ${key} boundary one word later`}
                           >
                             {key === 'start' ? 'Remove word →' : 'Add word →'}
                           </button>
@@ -509,17 +673,144 @@ function AutoStory() {
               </article>
             ))}
           </div>
+          <div className="auto-story-actions">
+            {!legacyValidated && (
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={validateLegacyRecipe}
+                disabled={validating}
+              >
+                {validating ? 'Checking…' : 'Check my recipe'}
+              </button>
+            )}
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={approveRender}
+              disabled={!legacyValidated || rendering}
+            >
+              {rendering ? 'Starting render…' : '✅ Approve & render'}
+            </button>
+          </div>
+        </section>
+      )}
+
+      {job.status === 'awaiting_recipe' && stories.length > 0 && (
+        <section className="auto-story-section">
+          <h3>3. Review the complete story plan</h3>
+          <p className="auto-story-help">
+            All {stories.length} narrative arcs and dialogue schedules have been created and checked before rendering.
+            Review them together. Reconstruct any one story without changing the others, or adjust word-boundary timings.
+          </p>
+          <div className="auto-story-plan-list">
+            {stories.map((story, storyIndex) => (
+              <article className="card auto-story-storyline auto-story-plan" key={story.story_id}>
+                <div className="auto-story-plan-heading">
+                  <div>
+                    <span className="auto-story-kicker">
+                      Story {storyIndex + 1} of {stories.length} · {story.validation?.estimated_runtime_sec?.toFixed(1) || '—'}s planned
+                    </span>
+                    <h4>{story.storyline.title}</h4>
+                    <p>{story.storyline.summary}</p>
+                    <div className="auto-story-meta">
+                      <span>Characters: {story.storyline.key_characters?.join(', ') || 'Not specified'}</span>
+                      <span>Speakers: {story.storyline.speaker_ids?.join(', ') || 'Not identified'}</span>
+                      <span>
+                        Episode span: {Math.floor(story.storyline.start_sec / 60)}:{String(Math.floor(story.storyline.start_sec % 60)).padStart(2, '0')}
+                        {' – '}
+                        {Math.floor(story.storyline.end_sec / 60)}:{String(Math.floor(story.storyline.end_sec % 60)).padStart(2, '0')}
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    onClick={() => reconstructStory(story.story_id)}
+                    disabled={!validated || validating || Boolean(reconstructingStoryId) || rendering}
+                  >
+                    {reconstructingStoryId === story.story_id
+                      ? <><span className="spinner"></span> Reconstructing…</>
+                      : '🔁 Reconstruct story'}
+                  </button>
+                </div>
+                <div className="auto-story-beats">
+                  {story.recipe?.beats?.map((beat, beatIndex) => (
+                    <article className="card auto-story-beat" key={beat.beat_id || beatIndex}>
+                      <div className="auto-story-beat-heading">
+                        <div>
+                          <span className="auto-story-kicker">Beat {beatIndex + 1} · {beat.narrative_role || 'Dialogue'}</span>
+                          <p className="auto-story-dialogue">“{beat.text}”</p>
+                          <span className="auto-story-meta-text">
+                            Speaker: {beat.speaker_ids?.join(', ') || 'Not identified'}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="auto-story-time-fields">
+                        {[
+                          { key: 'start', field: 'dialogue_start_sec', label: 'Start (seconds)' },
+                          { key: 'end', field: 'dialogue_end_sec', label: 'End (seconds)' },
+                        ].map(({ key, field, label }) => (
+                          <label key={key}>
+                            {label}
+                            <input
+                              className="form-input"
+                              type="number"
+                              step="0.01"
+                              value={beat[field]}
+                              onChange={event => editBeat(storyIndex, beatIndex, field, event.target.value)}
+                            />
+                            {story.timing_options?.[String(beat.beat_id ?? beatIndex + 1)]?.[key] && (
+                              <span className="auto-story-word-controls">
+                                <button
+                                  type="button"
+                                  className="btn btn-ghost btn-sm"
+                                  onClick={() => moveBeatBoundary(storyIndex, beatIndex, key, -1)}
+                                  disabled={!getAdjacentBoundary(storyIndex, beatIndex, key, -1)}
+                                  aria-label={`Move story ${storyIndex + 1} beat ${beatIndex + 1} ${key} boundary one word earlier`}
+                                >
+                                  {key === 'start' ? '← Add word' : '← Remove word'}
+                                </button>
+                                <span
+                                  className="auto-story-boundary-word"
+                                  title={getBoundaryWord(storyIndex, beat, beatIndex, key) || 'Time is not on a cached word boundary'}
+                                >
+                                  {getBoundaryWord(storyIndex, beat, beatIndex, key) || 'Custom time'}
+                                </span>
+                                <button
+                                  type="button"
+                                  className="btn btn-ghost btn-sm"
+                                  onClick={() => moveBeatBoundary(storyIndex, beatIndex, key, 1)}
+                                  disabled={!getAdjacentBoundary(storyIndex, beatIndex, key, 1)}
+                                  aria-label={`Move story ${storyIndex + 1} beat ${beatIndex + 1} ${key} boundary one word later`}
+                                >
+                                  {key === 'start' ? 'Remove word →' : 'Add word →'}
+                                </button>
+                              </span>
+                            )}
+                          </label>
+                        ))}
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              </article>
+            ))}
+          </div>
           {state.validation && validated && (
             <div className="auto-story-success">
-              Recipe valid: {state.validation.beat_count} beats, estimated {state.validation.estimated_runtime_sec.toFixed(1)} seconds.
+              All {state.validation.valid_story_count} stories are valid. Combined runtime:
+              {' '}{state.validation.estimated_runtime_sec.toFixed(1)} seconds. Approve once to render them separately.
             </div>
           )}
           <div className="auto-story-actions">
-            <button type="button" className="btn btn-secondary" onClick={validateRecipe} disabled={validating}>
-              {validating ? <><span className="spinner"></span> Checking…</> : 'Check my recipe'}
-            </button>
+            {!validated && (
+              <button type="button" className="btn btn-secondary" onClick={validatePlan} disabled={validating}>
+                {validating ? <><span className="spinner"></span> Checking…</> : 'Check the full plan'}
+              </button>
+            )}
             <button type="button" className="btn btn-primary" onClick={approveRender} disabled={!validated || rendering}>
-              {rendering ? <><span className="spinner"></span> Starting render…</> : '✅ Approve & render'}
+              {rendering ? <><span className="spinner"></span> Starting render…</> : '✅ Approve & render all stories'}
             </button>
           </div>
         </section>
@@ -527,27 +818,63 @@ function AutoStory() {
 
       {job.status === 'completed' && (
         <section className="auto-story-section">
-          <h3>Your montage is ready</h3>
-          {state.output_files?.some(file => file.filename.endsWith('.mp4')) && (
-            <video
-              className="auto-story-video"
-              controls
-              preload="metadata"
-              src={state.output_files.find(file => file.filename.endsWith('.mp4')).download_url}
-            />
+          <h3>Your stories are ready</h3>
+          {state.stories?.length ? state.stories.map((story, index) => (
+            <article className="card auto-story-storyline auto-story-result" key={story.story_id}>
+              <span className="auto-story-kicker">Story {index + 1} of {state.stories.length}</span>
+              <h4>{story.storyline.title}</h4>
+              <p>{story.storyline.summary}</p>
+              {story.output_files?.some(file => file.filename.endsWith('.mp4')) && (
+                <video
+                  className="auto-story-video"
+                  controls
+                  preload="metadata"
+                  src={story.output_files.find(file => file.filename.endsWith('.mp4')).download_url}
+                />
+              )}
+              <div className="auto-story-downloads">
+                {story.output_files?.map(file => (
+                  <a className="btn btn-secondary" href={file.download_url} download key={file.filename}>
+                    ⬇️ {file.filename}
+                  </a>
+                ))}
+              </div>
+            </article>
+          )) : (
+            <div className="auto-story-downloads">
+              {state.output_files?.map(file => (
+                <a className="btn btn-secondary" href={file.download_url} download key={file.filename}>
+                  ⬇️ {file.filename}
+                </a>
+              ))}
+            </div>
           )}
-          <div className="auto-story-downloads">
-            {state.output_files?.map(file => (
-              <a className="btn btn-secondary" href={file.download_url} download key={file.filename}>
-                ⬇️ {file.filename}
-              </a>
-            ))}
-          </div>
+          {state.output_files?.filter(file => file.filename === 'story_plan_manifest.json').map(file => (
+            <a className="btn btn-secondary" href={file.download_url} download key={file.filename}>
+              ⬇️ Download complete plan manifest
+            </a>
+          ))}
         </section>
       )}
 
       {job.status === 'failed' && (
         <section className="auto-story-section">
+          {state.output_files?.length > 0 && (
+            <div className="card auto-story-storyline auto-story-result">
+              <h3>Some stories rendered before the failure</h3>
+              <p>
+                {state.rendered_story_count || 0} of {state.story_count || state.stories?.length || 0}
+                {' '}stories completed. Download the available outputs before retrying.
+              </p>
+              <div className="auto-story-downloads">
+                {state.output_files.map(file => (
+                  <a className="btn btn-secondary" href={file.download_url} download key={file.filename}>
+                    ⬇️ {file.filename}
+                  </a>
+                ))}
+              </div>
+            </div>
+          )}
           <Link to="/auto-story" className="btn btn-primary">Start another Auto Story</Link>
         </section>
       )}
