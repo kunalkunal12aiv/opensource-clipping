@@ -1,4 +1,6 @@
+import hashlib
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -28,6 +30,18 @@ def test_flatten_words_rejects_reversed_timestamps():
         auto_story._flatten_words([{
             "words": [{"word": "invalid", "start": 2.0, "end": 1.0}],
         }])
+
+
+def test_transcript_format_uses_friendly_speaker_names_without_losing_word_ids():
+    formatted = auto_story._format_transcript([{
+        "word_id": "W000001",
+        "start": 1.0,
+        "end": 1.2,
+        "speaker_id": "SPEAKER_00",
+        "word": "Hello",
+    }], {"SPEAKER_00": "Alex"})
+
+    assert formatted == "W000001|1.000-1.200|Alex|Hello"
 
 
 def test_transcribe_video_reports_audio_progress(monkeypatch):
@@ -118,6 +132,8 @@ def test_transcript_and_diarization_are_cached_separately(monkeypatch, tmp_path)
 
     video_path = tmp_path / "episode.mp4"
     video_path.write_bytes(b"test video")
+    reuploaded_video_path = tmp_path / "second-upload-episode.mp4"
+    reuploaded_video_path.write_bytes(b"test video")
     cache_dir = tmp_path / "cache"
     calls = {"transcribe": 0, "diarize": 0}
 
@@ -151,19 +167,145 @@ def test_transcript_and_diarization_are_cached_separately(monkeypatch, tmp_path)
         hf_token="test-token",
         diarization_num_speakers="auto",
     )
+    cache_events = []
 
     first, key = auto_story._load_or_create_transcript(
-        str(video_path), "episode", str(cache_dir), cfg, 30.0
+        str(video_path), "episode", str(cache_dir), cfg, 30.0,
+        cache_callback=lambda event: cache_events.append(event),
     )
     cfg.hf_token = ""
     second, second_key = auto_story._load_or_create_transcript(
-        str(video_path), "episode", str(cache_dir), cfg, 30.0
+        str(reuploaded_video_path), "another-upload", str(cache_dir), cfg, 30.0,
+        cache_callback=lambda event: cache_events.append(event),
+    )
+    cfg.hf_token = "test-token"
+    cfg.diarization_num_speakers = 2
+    third, third_key = auto_story._load_or_create_transcript(
+        str(reuploaded_video_path), "another-upload", str(cache_dir), cfg, 30.0
     )
 
     assert key == second_key
+    assert third_key != key
     assert first == second
+    assert third == second
     assert first[0]["speaker_id"] == "SPEAKER_00"
-    assert calls == {"transcribe": 1, "diarize": 1}
+    assert calls == {"transcribe": 1, "diarize": 2}
+    assert cache_events[0] == {
+        "transcript": "missing", "diarization": "missing", "combined": "missing",
+    }
+    assert cache_events[-1] == {
+        "transcript": "reused", "diarization": "reused", "combined": "reused",
+    }
+
+
+def test_file_signature_is_stable_across_identical_upload_paths(tmp_path):
+    first = tmp_path / "first.mp4"
+    second = tmp_path / "second.mp4"
+    first.write_bytes(b"same video bytes")
+    second.write_bytes(b"same video bytes")
+
+    assert auto_story._file_signature(str(first)) == auto_story._file_signature(
+        str(second)
+    )
+
+    second.write_bytes(b"different video bytes")
+    assert auto_story._file_signature(str(first)) != auto_story._file_signature(
+        str(second)
+    )
+
+
+def test_content_cache_migrates_existing_upload_caches_without_reprocessing(
+    monkeypatch, tmp_path
+):
+    from clipping import diarization, engine
+
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    old_video = upload_dir / "old-upload-episode.mp4"
+    current_video = upload_dir / "new-upload-episode.mp4"
+    old_video.write_bytes(b"identical episode content")
+    current_video.write_bytes(b"identical episode content")
+
+    cache_root = tmp_path / "outputs" / "story_cache" / "auto_story"
+    old_source_id = "episode-" + hashlib.sha256(
+        old_video.name.encode("utf-8")
+    ).hexdigest()[:12]
+    old_cache_dir = cache_root / old_source_id
+    old_cache_dir.mkdir(parents=True)
+
+    old_stat = old_video.stat()
+    old_signature = {
+        "path": os.path.normcase(os.path.abspath(old_video)),
+        "size": old_stat.st_size,
+        "mtime_ns": old_stat.st_mtime_ns,
+    }
+    cfg = SimpleNamespace(
+        auto_story_whisper_model="small",
+        auto_story_whisper_device="cpu",
+        auto_story_whisper_compute_type="int8",
+        max_kata_per_subtitle=5,
+        hf_token="",
+    )
+    old_transcript_key = auto_story._digest({
+        "schema": 1,
+        "source": old_signature,
+        "whisper": {
+            "model": cfg.auto_story_whisper_model,
+            "device": cfg.auto_story_whisper_device,
+            "compute_type": cfg.auto_story_whisper_compute_type,
+            "max_words_per_subtitle": cfg.max_kata_per_subtitle,
+        },
+    })
+    old_diarization_key = auto_story._digest({
+        "schema": 1,
+        "source": old_signature,
+        "model": auto_story.DIARIZATION_MODEL,
+    })
+    auto_story._write_cache(
+        str(old_cache_dir / "transcript_words.json"),
+        old_transcript_key,
+        {
+            "words": [{
+                "word": "Hello.",
+                "start": 0.1,
+                "end": 0.9,
+                "word_id": "W000001",
+            }],
+        },
+    )
+    auto_story._write_cache(
+        str(old_cache_dir / "speaker_turns.json"),
+        old_diarization_key,
+        {"speaker_turns": [{
+            "speaker": "SPEAKER_00",
+            "start": 0.0,
+            "end": 1.0,
+        }]},
+    )
+
+    def unexpected_processing(*_args, **_kwargs):
+        pytest.fail("A valid legacy cache should avoid reprocessing.")
+
+    monkeypatch.setattr(engine, "transcribe_video", unexpected_processing)
+    monkeypatch.setattr(diarization, "extract_audio", unexpected_processing)
+    monkeypatch.setattr(diarization, "run_diarization", unexpected_processing)
+
+    source_signature = auto_story._file_signature(str(current_video))
+    source_id = f"episode-{source_signature['content_sha256'][:24]}"
+    current_cache_dir = cache_root / source_id
+    words, cache_key = auto_story._load_or_create_transcript(
+        str(current_video),
+        source_id,
+        str(current_cache_dir),
+        cfg,
+        30.0,
+        source_signature=source_signature,
+    )
+
+    assert words[0]["speaker_id"] == "SPEAKER_00"
+    assert auto_story._read_cache(
+        str(current_cache_dir / "combined_transcript.json"), cache_key
+    )["words"] == words
 
 
 def test_recipe_validation_enforces_span_gaps_and_runtime():
@@ -499,6 +641,90 @@ def test_storyline_discovery_accepts_variable_count_and_saves_actual_count(
     assert discovery_file["story_count"] == 2
     assert "as many strong, distinct" in prompts[0]
     assert "up to eight" in prompts[0]
+
+
+def test_storyline_discovery_corrects_one_invalid_provider_response(monkeypatch, tmp_path):
+    words = [{
+        "word_id": "W000001",
+        "word": "hello.",
+        "start": 0.0,
+        "end": 1.0,
+        "speaker_id": "SPEAKER_00",
+    }]
+    valid_arc = {
+        "id": "arc_1",
+        "title": "A clear moment",
+        "summary": "A setup happens. A payoff follows.",
+        "key_characters": [],
+        "source_ranges": [{"start_word_id": "W000001", "end_word_id": "W000001"}],
+    }
+    responses = iter([
+        {"storylines": [{**valid_arc, "source_ranges": [{
+            "start_word_id": "NOT_A_WORD", "end_word_id": "W000001",
+        }]}]},
+        {"storylines": [valid_arc]},
+    ])
+    prompts = []
+    monkeypatch.setattr(
+        auto_story,
+        "_request_json",
+        lambda prompt, _schema, _cfg: prompts.append(prompt) or next(responses),
+    )
+    cfg = SimpleNamespace(
+        ai_provider="gemini",
+        api_key_gemini="test-key",
+        gemini_model="test-model",
+        nvidia_model="test-model",
+    )
+
+    result = auto_story._discover_storylines(
+        words, 10.0, "transcript-key", str(tmp_path / "cache"),
+        str(tmp_path / "output"), cfg, count=None,
+    )
+
+    assert result[0]["id"] == "arc_1"
+    assert len(prompts) == 2
+    assert "previous response failed validation" in prompts[1]
+
+
+def test_ai_request_retries_transient_provider_errors_only(monkeypatch):
+    import requests
+
+    calls = []
+
+    class Response:
+        def __init__(self, status, payload=None):
+            self.status_code = status
+            self.payload = payload
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                error = requests.HTTPError("provider error")
+                error.response = self
+                raise error
+
+        def json(self):
+            return self.payload
+
+    responses = iter([
+        Response(503),
+        Response(200, {"choices": [{"message": {"content": '{"beats": []}'}}]}),
+    ])
+    monkeypatch.setattr(requests, "post", lambda *_args, **_kwargs: calls.append(1) or next(responses))
+    monkeypatch.setattr(auto_story.time, "sleep", lambda _seconds: None)
+    cfg = SimpleNamespace(
+        ai_provider="nvidia",
+        api_key_nvidia="test-key",
+        nvidia_model="test-model",
+    )
+
+    assert auto_story._request_json("prompt", {}, cfg) == {"beats": []}
+    assert len(calls) == 2
+
+    class Unauthorized(Exception):
+        code = 401
+
+    assert not auto_story._is_retryable_ai_error(Unauthorized())
 
 
 def test_storyline_and_beat_ai_passes_reuse_cached_responses(monkeypatch, tmp_path):

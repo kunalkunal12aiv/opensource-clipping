@@ -31,6 +31,14 @@ async def lifespan(app: FastAPI):
     log_path = configure_logging(role="api")
     log_event("api.startup.started", component="api", stage="startup")
     print("🚀 OpenSource Clipping Studio — Backend starting...")
+    resumed_auto_story_jobs = await auto_story_worker.recover_interrupted_auto_story_jobs()
+    if resumed_auto_story_jobs:
+        log_event(
+            "auto_story_restart_recovery_scheduled",
+            component="api",
+            stage="startup",
+            count=resumed_auto_story_jobs,
+        )
     if log_path is not None:
         print(f"Studio diagnostic log: {log_path}", flush=True)
     log_event("api.startup.completed", component="api", stage="startup")

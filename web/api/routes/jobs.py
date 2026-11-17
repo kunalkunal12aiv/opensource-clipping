@@ -61,6 +61,7 @@ def _job_to_response(job: dict) -> JobResponse:
         cancel_requested=job.get("cancel_requested", False),
         log=job.get("log", []),
         auto_story=job.get("auto_story"),
+        persistence=store.get_persistence_status(),
     )
 
 

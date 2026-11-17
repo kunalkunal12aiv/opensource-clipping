@@ -3,19 +3,53 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import {
   cancelAutoStory,
   createAutoStory,
+  fetchAutoStorySpeakerTranscript,
   fetchAutoStory,
+  fetchAutoStoryProjects,
   fetchSettings,
+  importAutoStoryProject,
   rediscoverAutoStorylines,
+  reopenAutoStoryReview,
+  retryAutoStoryDiscovery,
+  retryAutoStoryRender,
+  retryAutoStoryline,
   reconstructAutoStoryStory,
   renderAutoStory,
   selectAutoStoryline,
   selectAutoStorylines,
+  saveAutoStorySpeakerNames,
   uploadVideo,
   validateAutoStoryRecipe,
   validateAutoStoryPlan,
 } from '../api'
 
 const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled']
+
+function TransferProgress({ label, percent, onCancel, cancellable = true }) {
+  return (
+    <div className="auto-story-transfer" role="status" aria-live="polite">
+      <div className="auto-story-transfer-heading">
+        <span>{label}</span>
+        <span>{percent}%</span>
+      </div>
+      <div
+        className="progress-bar-bg"
+        role="progressbar"
+        aria-label={label}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percent}
+      >
+        <div className="progress-bar-fill" style={{ width: `${percent}%` }}></div>
+      </div>
+      {cancellable && (
+        <button type="button" className="btn btn-ghost btn-sm" onClick={onCancel}>
+          Cancel transfer
+        </button>
+      )}
+    </div>
+  )
+}
 
 function getDefaultStorylineSelection(autoStory) {
   const failedIds = new Set(
@@ -30,15 +64,28 @@ function AutoStory() {
   const { jobId } = useParams()
   const navigate = useNavigate()
   const fileRef = useRef(null)
+  const projectImportRef = useRef(null)
+  const uploadController = useRef(null)
+  const importController = useRef(null)
+  const speakerPreviewRef = useRef(null)
   const planTouched = useRef(false)
   const selectionTouched = useRef(false)
+  const speakerNamesTouched = useRef(false)
   const displayedDiscoveryRevision = useRef(null)
+  const lastJobUpdatedAt = useRef(null)
   const [settings, setSettings] = useState(null)
   const [settingsError, setSettingsError] = useState('')
   const [selectedFile, setSelectedFile] = useState(null)
   const [uploadFilename, setUploadFilename] = useState('')
   const [uploading, setUploading] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState(0)
+  const [importingProject, setImportingProject] = useState(false)
+  const [importProgress, setImportProgress] = useState(0)
+  const [importUploadComplete, setImportUploadComplete] = useState(false)
   const [targetDuration, setTargetDuration] = useState(60)
+  const [minGapSec, setMinGapSec] = useState(30)
+  const [diarizationSpeakers, setDiarizationSpeakers] = useState('auto')
+  const [whisperModel, setWhisperModel] = useState('small')
   const [provider, setProvider] = useState('gemini')
   const [creating, setCreating] = useState(false)
   const [job, setJob] = useState(null)
@@ -49,12 +96,34 @@ function AutoStory() {
   const [legacyValidated, setLegacyValidated] = useState(false)
   const [validating, setValidating] = useState(false)
   const [selectedStorylineIds, setSelectedStorylineIds] = useState([])
+  const [speakerNameDraft, setSpeakerNameDraft] = useState({})
+  const [speakerMergeDraft, setSpeakerMergeDraft] = useState({})
+  const [speakerTranscriptOpen, setSpeakerTranscriptOpen] = useState(false)
+  const [speakerTranscriptTurns, setSpeakerTranscriptTurns] = useState([])
+  const [speakerTranscriptOffset, setSpeakerTranscriptOffset] = useState(0)
+  const [speakerTranscriptTotal, setSpeakerTranscriptTotal] = useState(0)
+  const [speakerCorrections, setSpeakerCorrections] = useState([])
+  const [speakerTranscriptLoading, setSpeakerTranscriptLoading] = useState(false)
+  const [activeSpeakerPreview, setActiveSpeakerPreview] = useState('')
+  const [savedProjects, setSavedProjects] = useState([])
+  const [savedProjectsTotal, setSavedProjectsTotal] = useState(0)
+  const [savedProjectsError, setSavedProjectsError] = useState('')
+  const [projectStorageStatus, setProjectStorageStatus] = useState(null)
+  const [loadingProjects, setLoadingProjects] = useState(false)
+  const [loadingMoreProjects, setLoadingMoreProjects] = useState(false)
+  const [projectSearch, setProjectSearch] = useState('')
+  const [reviewBeforeRender, setReviewBeforeRender] = useState(false)
   const [selecting, setSelecting] = useState(false)
   const [rediscovering, setRediscovering] = useState(false)
+  const [retryingDiscovery, setRetryingDiscovery] = useState(false)
+  const [retryingRender, setRetryingRender] = useState(false)
+  const [retryingStorylineId, setRetryingStorylineId] = useState('')
+  const [reopeningReview, setReopeningReview] = useState(false)
   const [reconstructingStoryId, setReconstructingStoryId] = useState('')
   const [rendering, setRendering] = useState(false)
   const [cancelling, setCancelling] = useState(false)
   const [error, setError] = useState('')
+  const [connectionError, setConnectionError] = useState('')
   const legacyTouched = useRef(false)
 
   useEffect(() => {
@@ -72,15 +141,88 @@ function AutoStory() {
   }, [])
 
   useEffect(() => {
+    if (jobId) return undefined
+    let active = true
+    setLoadingProjects(true)
+    setSavedProjects([])
+    setSavedProjectsTotal(0)
+    const timer = setTimeout(() => {
+      fetchAutoStoryProjects({ query: projectSearch, offset: 0, limit: 20 })
+      .then(result => {
+        if (active) {
+          setSavedProjects(result.projects || [])
+          setSavedProjectsTotal(result.total || 0)
+          setProjectStorageStatus(result.storage || null)
+          setSavedProjectsError('')
+        }
+      })
+      .catch(err => {
+        if (active) setSavedProjectsError(err.message)
+      })
+      .finally(() => {
+        if (active) setLoadingProjects(false)
+      })
+    }, 180)
+    return () => {
+      active = false
+      clearTimeout(timer)
+    }
+  }, [jobId, projectSearch])
+
+  const loadMoreProjects = async () => {
+    if (loadingMoreProjects || savedProjects.length >= savedProjectsTotal) return
+    setLoadingMoreProjects(true)
+    setSavedProjectsError('')
+    try {
+      const result = await fetchAutoStoryProjects({
+        query: projectSearch,
+        offset: savedProjects.length,
+        limit: 20,
+      })
+      setSavedProjects(current => [...current, ...(result.projects || [])])
+      setSavedProjectsTotal(result.total || 0)
+      setProjectStorageStatus(result.storage || null)
+    } catch (err) {
+      setSavedProjectsError(err.message)
+    } finally {
+      setLoadingMoreProjects(false)
+    }
+  }
+
+  useEffect(() => {
     if (!jobId) return undefined
     let active = true
     let timeout
+    let consecutiveFailures = 0
+    lastJobUpdatedAt.current = null
+    displayedDiscoveryRevision.current = null
+    selectionTouched.current = false
+    speakerNamesTouched.current = false
+    planTouched.current = false
+    legacyTouched.current = false
+    setJob(null)
+    setStories([])
+    setLegacyRecipe(null)
+    setLegacyTimingOptions(null)
+    setValidated(false)
+    setLegacyValidated(false)
+    setSpeakerNameDraft({})
+    setSpeakerTranscriptOpen(false)
+    setSpeakerTranscriptTurns([])
+    setSpeakerTranscriptOffset(0)
+    setSpeakerTranscriptTotal(0)
+    setSpeakerCorrections([])
 
     const poll = async () => {
       try {
         const data = await fetchAutoStory(jobId)
         if (!active) return
-        setJob(data)
+        consecutiveFailures = 0
+        setConnectionError('')
+        if (lastJobUpdatedAt.current !== data.updated_at) {
+          lastJobUpdatedAt.current = data.updated_at
+          setJob(data)
+        }
         const currentDiscoveryRevision = data.auto_story?.discovery_revision ?? 0
         if (
           data.status === 'awaiting_storyline'
@@ -89,6 +231,9 @@ function AutoStory() {
           displayedDiscoveryRevision.current = currentDiscoveryRevision
           selectionTouched.current = false
           setSelectedStorylineIds(getDefaultStorylineSelection(data.auto_story))
+          speakerNamesTouched.current = false
+          setSpeakerNameDraft(data.auto_story?.speaker_names || {})
+          setSpeakerMergeDraft(data.auto_story?.speaker_merges || {})
         } else if (
           data.status === 'awaiting_storyline'
           && !selectionTouched.current
@@ -114,10 +259,16 @@ function AutoStory() {
           setReconstructingStoryId('')
         }
         if (!TERMINAL_STATUSES.includes(data.status)) {
-          timeout = setTimeout(poll, 2000)
+          const atUserCheckpoint = ['awaiting_storyline', 'awaiting_recipe'].includes(data.status)
+          timeout = setTimeout(poll, atUserCheckpoint ? 5000 : 2000)
         }
       } catch (err) {
-        if (active) setError(err.message)
+        if (active) {
+          consecutiveFailures += 1
+          setConnectionError(`Connection interrupted. Retrying in a few seconds: ${err.message}`)
+          const retryDelay = Math.min(30000, 2000 * (2 ** Math.min(consecutiveFailures - 1, 4)))
+          timeout = setTimeout(poll, retryDelay)
+        }
       }
     }
 
@@ -131,21 +282,67 @@ function AutoStory() {
   const handleFile = async (event) => {
     const file = event.target.files?.[0]
     if (!file) return
+    if (file.size > 2 * 1024 ** 3) {
+      setError('Episode videos must be 2 GB or smaller.')
+      event.target.value = ''
+      return
+    }
     setSelectedFile(file)
     setUploadFilename('')
     setError('')
     setUploading(true)
+    setUploadProgress(0)
+    uploadController.current = new AbortController()
     try {
-      const result = await uploadVideo(file)
+      const result = await uploadVideo(
+        file,
+        percent => setUploadProgress(percent),
+        uploadController.current.signal,
+      )
       setUploadFilename(result.filename)
     } catch (err) {
       setSelectedFile(null)
-      setError(err.message)
+      if (err.name !== 'AbortError') setError(err.message)
     } finally {
+      uploadController.current = null
       setUploading(false)
       event.target.value = ''
     }
   }
+
+  const handleProjectImport = async (event) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+    if (file.size > 12 * 1024 ** 3) {
+      setError('Project archives must be 12 GB or smaller.')
+      event.target.value = ''
+      return
+    }
+    setImportingProject(true)
+    setImportProgress(0)
+    setImportUploadComplete(false)
+    setError('')
+    importController.current = new AbortController()
+    try {
+      const restored = await importAutoStoryProject(
+        file,
+        percent => setImportProgress(percent),
+        importController.current.signal,
+        () => setImportUploadComplete(true),
+      )
+      navigate(`/auto-story/${restored.id}`)
+    } catch (err) {
+      if (err.name !== 'AbortError') setError(err.message)
+    } finally {
+      importController.current = null
+      setImportingProject(false)
+      setImportUploadComplete(false)
+      event.target.value = ''
+    }
+  }
+
+  const cancelUpload = () => uploadController.current?.abort()
+  const cancelProjectImport = () => importController.current?.abort()
 
   const startAutoStory = async (event) => {
     event.preventDefault()
@@ -160,6 +357,9 @@ function AutoStory() {
         upload_filename: uploadFilename,
         source_name: selectedFile.name,
         target_duration_sec: Number(targetDuration),
+        min_gap_sec: Number(minGapSec),
+        diarization_speakers: diarizationSpeakers === 'auto' ? null : Number(diarizationSpeakers),
+        whisper_model: whisperModel,
         ai_provider: provider,
       })
       navigate(`/auto-story/${created.id}`)
@@ -201,7 +401,7 @@ function AutoStory() {
     setSelecting(true)
     setError('')
     try {
-      const updated = await selectAutoStorylines(jobId, selectedStorylineIds)
+      const updated = await selectAutoStorylines(jobId, selectedStorylineIds, reviewBeforeRender)
       setJob(updated)
     } catch (err) {
       setError(err.message)
@@ -222,6 +422,147 @@ function AutoStory() {
       setError(err.message)
     } finally {
       setRediscovering(false)
+    }
+  }
+
+  const saveSpeakerNames = async () => {
+    setRediscovering(true)
+    setError('')
+    try {
+      selectionTouched.current = false
+      setJob(await saveAutoStorySpeakerNames(
+        jobId,
+        speakerNameDraft,
+        speakerCorrections,
+        speakerMergeDraft,
+      ))
+      speakerNamesTouched.current = false
+      setSpeakerCorrections([])
+      setSpeakerTranscriptTurns([])
+      setSpeakerTranscriptOpen(false)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setRediscovering(false)
+    }
+  }
+
+  const loadSpeakerTranscript = async (offset = 0) => {
+    setSpeakerTranscriptLoading(true)
+    setError('')
+    try {
+      const result = await fetchAutoStorySpeakerTranscript(jobId, offset)
+      setSpeakerTranscriptTurns(current => offset ? [...current, ...result.turns] : result.turns)
+      setSpeakerTranscriptOffset(offset + result.turns.length)
+      setSpeakerTranscriptTotal(result.total)
+      setSpeakerTranscriptOpen(true)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setSpeakerTranscriptLoading(false)
+    }
+  }
+
+  const updateSpeakerTurn = (turn, value) => {
+    const correction = {
+      start_word_id: turn.start_word_id,
+      end_word_id: turn.end_word_id,
+      speaker_id: value || null,
+    }
+    setSpeakerCorrections(current => [
+      ...current.filter(item => (
+        item.start_word_id !== correction.start_word_id
+        || item.end_word_id !== correction.end_word_id
+      )),
+      correction,
+    ])
+    setSpeakerTranscriptTurns(current => current.map(item => (
+      item.start_word_id === turn.start_word_id && item.end_word_id === turn.end_word_id
+        ? { ...item, speaker_id: correction.speaker_id }
+        : item
+    )))
+  }
+
+  const previewSourceInterval = (startSec, endSec, key) => {
+    const audio = speakerPreviewRef.current
+    if (!audio) return
+    const start = Math.max(0, Number(startSec) || 0)
+    const end = Math.max(start, Number(endSec) || start) + 0.2
+    setActiveSpeakerPreview(key)
+    audio.pause()
+    const startPlayback = () => {
+      audio.currentTime = start
+      audio.play().catch(err => {
+        setActiveSpeakerPreview('')
+        setError(`Could not play this source interval: ${err.message}`)
+      })
+    }
+    if (audio.readyState >= 1) startPlayback()
+    else audio.addEventListener('loadedmetadata', startPlayback, { once: true })
+    audio.dataset.previewEnd = String(end)
+  }
+
+  const previewSpeakerTurn = turn => previewSourceInterval(
+    turn.start_sec,
+    turn.end_sec,
+    `${turn.start_word_id}-${turn.end_word_id}`,
+  )
+
+  const stopSpeakerPreviewAtTurnEnd = () => {
+    const audio = speakerPreviewRef.current
+    const end = Number(audio?.dataset.previewEnd)
+    if (audio && Number.isFinite(end) && audio.currentTime >= end) {
+      audio.pause()
+      setActiveSpeakerPreview('')
+    }
+  }
+
+  const retryDiscoveryFromCache = async () => {
+    setRetryingDiscovery(true)
+    setError('')
+    try {
+      setJob(await retryAutoStoryDiscovery(jobId))
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setRetryingDiscovery(false)
+    }
+  }
+
+  const retryRenderFromPlan = async () => {
+    setRetryingRender(true)
+    setError('')
+    try {
+      setJob(await retryAutoStoryRender(jobId))
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setRetryingRender(false)
+    }
+  }
+
+  const retryFailedStory = async (storylineId) => {
+    setRetryingStorylineId(storylineId)
+    setError('')
+    try {
+      setJob(await retryAutoStoryline(jobId, storylineId))
+    } catch (err) {
+      setError(err.message)
+      setRetryingStorylineId('')
+    }
+  }
+
+  const editCompletedProject = async () => {
+    setReopeningReview(true)
+    setError('')
+    try {
+      setJob(await reopenAutoStoryReview(jobId))
+      planTouched.current = false
+      setValidated(true)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setReopeningReview(false)
     }
   }
 
@@ -488,7 +829,6 @@ function AutoStory() {
       ? settings?.google_api_key_set
       : settings?.nvidia_api_key_set
     const readyForStart = Boolean(settings?.hf_token_set && providerKeySet)
-
     return (
       <div className="fade-in">
         <div className="page-header">
@@ -498,11 +838,112 @@ function AutoStory() {
           </div>
         </div>
 
+        <section className="card auto-story-card">
+          <h3 className="card-title">Restore a saved project</h3>
+          <p className="auto-story-help">
+            Import an Auto Story project archive to restore its episode, transcript cache, plans and rendered files.
+          </p>
+          <input
+            ref={projectImportRef}
+            type="file"
+            accept=".zip,application/zip"
+            onChange={handleProjectImport}
+            hidden
+          />
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => projectImportRef.current?.click()}
+            disabled={importingProject}
+          >
+            {importingProject ? <><span className="spinner"></span> Restoring project…</> : 'Import Auto Story project (.zip)'}
+          </button>
+          <p className="form-hint">Large archives may take time to upload; the progress bar tracks transfer to the backend.</p>
+          {importingProject && (
+            <TransferProgress
+              label={importUploadComplete ? 'Archive uploaded; restoring project on backend…' : 'Uploading project archive'}
+              percent={importProgress}
+              onCancel={cancelProjectImport}
+              cancellable={!importUploadComplete}
+            />
+          )}
+        </section>
+
+        <section className="card auto-story-card auto-story-project-library">
+          <div className="auto-story-library-heading">
+            <div>
+              <h3 className="card-title">Saved Auto Story projects</h3>
+              <p className="auto-story-help">Projects are stored on the connected backend. Use a backup to move them or keep them beyond a temporary runtime.</p>
+            </div>
+            <span className="auto-story-library-count">{savedProjectsTotal}</span>
+          </div>
+          <label className="auto-story-project-search">
+            <span className="sr-only">Search saved projects</span>
+            <input
+              className="form-input"
+              type="search"
+              value={projectSearch}
+              onChange={event => setProjectSearch(event.target.value)}
+              placeholder="Search by project, file, ID, or status"
+            />
+          </label>
+          {savedProjectsError && <p className="auto-story-warning" role="status">Could not load saved projects: {savedProjectsError}</p>}
+          {projectStorageStatus && !projectStorageStatus.healthy && (
+            <p className="auto-story-warning" role="alert">
+              The backend cannot confirm that project records are saving. Download backups for projects you need to keep. Storage error: {projectStorageStatus.error_type || 'unknown'}.
+              {projectStorageStatus.recovery_required
+                ? ' The saved project index could not be read and is protected from being overwritten; recover a valid jobs.json and restart the backend before relying on local persistence.'
+                : ' The backend will retry saving on its next update; keep portable backups until this warning clears.'}
+            </p>
+          )}
+          {loadingProjects && savedProjects.length === 0 && <p className="auto-story-help">Loading saved projects…</p>}
+          {!loadingProjects && !savedProjectsError && savedProjects.length === 0 && (
+            <p className="auto-story-help">
+              {projectSearch.trim() ? 'No projects match this search.' : 'No saved Auto Story projects yet.'}
+            </p>
+          )}
+          <div className="auto-story-project-list">
+            {savedProjects.map(project => {
+              const canExport = !['queued', 'downloading', 'transcribing', 'analyzing', 'rendering'].includes(project.status)
+              return (
+                <article className="auto-story-project-row" key={project.id}>
+                  <div className="auto-story-project-details">
+                    <strong>{project.source_name || project.upload_filename || 'Auto Story project'}</strong>
+                    <span>{project.id} · {project.story_count || 0} stories</span>
+                    <span>{project.updated_at ? new Date(project.updated_at).toLocaleString() : 'Saved'}</span>
+                  </div>
+                  <div className="auto-story-project-actions">
+                    <span className={`badge badge-${project.status}`}>{project.status.replace(/_/g, ' ')}</span>
+                    <Link to={`/auto-story/${encodeURIComponent(project.id)}`} className="btn btn-secondary btn-sm">Open</Link>
+                    {canExport && (
+                      <a className="btn btn-ghost btn-sm" href={`/api/auto-story/${encodeURIComponent(project.id)}/project`}>
+                        Backup
+                      </a>
+                    )}
+                  </div>
+                </article>
+              )
+            })}
+          </div>
+          {savedProjects.length < savedProjectsTotal && (
+            <button
+              type="button"
+              className="btn btn-ghost"
+              onClick={loadMoreProjects}
+              disabled={loadingMoreProjects || loadingProjects}
+            >
+              {loadingMoreProjects ? 'Loading more projects…' : `Load more (${savedProjects.length} of ${savedProjectsTotal})`}
+            </button>
+          )}
+        </section>
+
+        {error && <div className="auto-story-error" role="alert">{error}</div>}
+
         <form onSubmit={startAutoStory}>
           <div className="card auto-story-card">
             <h3 className="card-title">1. Choose your episode</h3>
             <p className="auto-story-help">
-              Select a video from your computer. It stays on this machine and is uploaded to your local Studio.
+            Select a video from your computer. It is uploaded to the connected Studio backend for processing.
             </p>
             <input
               ref={fileRef}
@@ -526,6 +967,13 @@ function AutoStory() {
                 </span>
               )}
             </div>
+            {uploading && (
+              <TransferProgress
+                label="Uploading episode"
+                percent={uploadProgress}
+                onCancel={cancelUpload}
+              />
+            )}
             <p className="form-hint">MP4, MKV, AVI, MOV, WebM (maximum 2 GB).</p>
           </div>
 
@@ -556,6 +1004,58 @@ function AutoStory() {
                   <option value="gemini">Google Gemini</option>
                   <option value="nvidia">NVIDIA NIM</option>
                 </select>
+              </div>
+              <div className="form-group">
+                <label className="form-label" htmlFor="auto-story-min-gap">Minimum gap between moments</label>
+                <select
+                  id="auto-story-min-gap"
+                  className="form-select"
+                  value={minGapSec}
+                  onChange={event => setMinGapSec(event.target.value)}
+                >
+                  {[15, 20, 25, 30, 40, 60].map(seconds => (
+                    <option value={seconds} key={seconds}>{seconds} seconds</option>
+                  ))}
+                </select>
+                <span className="form-hint">
+                  Controls how far apart selected moments should be in the episode. Shorter gaps can create denser stories; 30 seconds is a balanced default.
+                </span>
+              </div>
+              <div className="form-group">
+                <label className="form-label" htmlFor="auto-story-speaker-count">Expected speaker count</label>
+                <select
+                  id="auto-story-speaker-count"
+                  className="form-select"
+                  value={diarizationSpeakers}
+                  onChange={event => setDiarizationSpeakers(event.target.value)}
+                >
+                  <option value="auto">Automatic (recommended)</option>
+                  {Array.from({ length: 16 }, (_, index) => index + 1).map(count => (
+                    <option value={count} key={count}>{count} {count === 1 ? 'speaker' : 'speakers'}</option>
+                  ))}
+                </select>
+                <span className="form-hint">
+                  Keep Automatic unless you know the exact count. A fixed count helps when speakers overlap or sound similar.
+                </span>
+              </div>
+              <div className="form-group">
+                <label className="form-label" htmlFor="auto-story-whisper-model">Transcription model</label>
+                <select
+                  id="auto-story-whisper-model"
+                  className="form-select"
+                  value={whisperModel}
+                  onChange={event => setWhisperModel(event.target.value)}
+                >
+                  <option value="tiny">Tiny · fastest, lower accuracy</option>
+                  <option value="base">Base · fast</option>
+                  <option value="small">Small · balanced (default)</option>
+                  <option value="medium">Medium · slower, more accurate</option>
+                  <option value="large-v3">Large v3 · highest accuracy, most resources</option>
+                  <option value="large-v3-turbo">Large v3 Turbo · high accuracy, GPU recommended</option>
+                </select>
+                <span className="form-hint">
+                  Larger models use more memory and take longer. Device and compute type remain automatic for this backend.
+                </span>
               </div>
             </div>
             <div className="auto-story-note">
@@ -597,8 +1097,20 @@ function AutoStory() {
   }
 
   const state = job.auto_story || {}
+  const canonicalSpeakerIds = (state.speaker_ids || []).filter(
+    speakerId => !speakerMergeDraft[speakerId],
+  )
+  const speakerEditsDirty = Boolean(
+    speakerNamesTouched.current
+    || speakerCorrections.length
+    || JSON.stringify(speakerMergeDraft) !== JSON.stringify(state.speaker_merges || {}),
+  )
   const active = !TERMINAL_STATUSES.includes(job.status)
   const progress = job.progress?.percent || 0
+  const canRetryRender = Boolean(
+    (state.stories?.length && state.validation && state.stories.every(story => story.validation))
+    || (state.recipe && state.validation && state.selected_storyline_id),
+  )
 
   return (
     <div className="fade-in">
@@ -612,6 +1124,13 @@ function AutoStory() {
         </div>
         <div className="auto-story-header-actions">
           <span className={`badge badge-${job.status}`}>{job.status.replace(/_/g, ' ')}</span>
+          <a
+            className="btn btn-ghost btn-sm"
+            href={`/api/auto-story/${encodeURIComponent(jobId)}/diagnostics`}
+            download
+          >
+            Download diagnostics
+          </a>
           <Link to="/" className="btn btn-ghost btn-sm">← Dashboard</Link>
         </div>
       </div>
@@ -626,8 +1145,13 @@ function AutoStory() {
             <div className="progress-bar-fill" style={{ width: `${progress}%` }}></div>
           </div>
           <p className="auto-story-help">
-            Long episodes can take a while to transcribe. Keep the backend terminal open; you can return to this page later.
+            Long episodes can take a while to transcribe. You can return to this page while the backend continues working. Download a recovery backup before a temporary runtime shuts down.
           </p>
+          {job.status !== 'rendering' && (
+            <a className="btn btn-secondary btn-sm" href={`/api/auto-story/${encodeURIComponent(jobId)}/project`}>
+              Download recovery backup
+            </a>
+          )}
           <button type="button" className="btn btn-danger btn-sm" onClick={requestCancel} disabled={cancelling}>
             {cancelling ? 'Requesting…' : 'Cancel'}
           </button>
@@ -635,15 +1159,195 @@ function AutoStory() {
       )}
 
       {error && <div className="auto-story-error" role="alert">{error}</div>}
+      {connectionError && <div className="auto-story-warning" role="status">{connectionError}</div>}
+      {job.persistence && !job.persistence.healthy && (
+        <div className="auto-story-warning" role="alert">
+          The backend cannot confirm that this project is saving to disk. Download a portable backup as soon as the current stage reaches a safe checkpoint.
+          {job.persistence.recovery_required
+            ? ' Its existing job index could not be read and will not be replaced automatically; restore a valid jobs.json before relying on backend persistence.'
+            : ` Save error: ${job.persistence.error_type || 'unknown'}.`}
+        </div>
+      )}
       {job.error && <div className="auto-story-error" role="alert">{job.error}</div>}
 
       {job.status === 'awaiting_storyline' && (
         <section className="auto-story-section">
           <h3>Choose which stories to create</h3>
+          <a className="btn btn-secondary" href={`/api/auto-story/${encodeURIComponent(jobId)}/project`}>
+            Download project backup
+          </a>
+          {state.last_failed_stage && (
+            <div className="auto-story-warning" role="status">
+              {state.message || 'The last stage failed. Update provider settings if needed, then retry discovery.'}
+            </div>
+          )}
           <p className="auto-story-help">
             Select one or more storylines. All are selected initially; uncheck any you do not want.
-            After you continue, the backend automatically creates and renders the selected stories.
+            The backend automatically creates and renders them unless you choose manual timing review below.
           </p>
+          {!!state.speaker_ids?.length && (
+            <div className="auto-story-speaker-review">
+              <h4>Who is speaking?</h4>
+              <p className="auto-story-help">
+                Diarization groups words by detected voice and assigns labels such as SPEAKER_00. Name speakers, merge duplicate labels for one person, and correct individual transcript turns before creating stories.
+              </p>
+              <div className="auto-story-speaker-fields">
+                {state.speaker_ids.map((speakerId, index) => {
+                  let mergedInto = speakerMergeDraft[speakerId] || ''
+                  while (speakerMergeDraft[mergedInto]) mergedInto = speakerMergeDraft[mergedInto]
+                  return (
+                    <div className="auto-story-speaker-edit" key={speakerId}>
+                      <span>{speakerId}</span>
+                      {mergedInto
+                        ? <span className="auto-story-speaker-merge-note">Merged into {mergedInto}</span>
+                        : <input
+                          className="form-input"
+                          maxLength={60}
+                          placeholder={`Speaker ${index + 1} (optional name)`}
+                          value={speakerNameDraft[speakerId] || ''}
+                          onChange={event => {
+                            speakerNamesTouched.current = true
+                            setSpeakerNameDraft(current => ({ ...current, [speakerId]: event.target.value }))
+                          }}
+                        />}
+                      <select
+                        className="form-select"
+                        aria-label={`Merge ${speakerId} into another speaker`}
+                        value={mergedInto}
+                        onChange={event => {
+                          speakerNamesTouched.current = true
+                          setSpeakerMergeDraft(current => {
+                            const next = { ...current }
+                            if (event.target.value) next[speakerId] = event.target.value
+                            else delete next[speakerId]
+                            return next
+                          })
+                        }}
+                      >
+                        <option value="">Keep separate</option>
+                        {canonicalSpeakerIds.filter(target => target !== speakerId).map(target => (
+                          <option value={target} key={target}>Merge into {target}</option>
+                        ))}
+                      </select>
+                    </div>
+                  )
+                })}
+              </div>
+              {speakerEditsDirty && (
+                <p className="auto-story-warning" role="status">
+                  Save these speaker edits before selecting storylines; otherwise they will not be applied.
+                </p>
+              )}
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={saveSpeakerNames}
+                disabled={rediscovering || selecting || !speakerEditsDirty}
+              >
+                {rediscovering
+                  ? 'Updating storylines…'
+                  : speakerCorrections.length
+                    ? 'Save speaker corrections & refresh storylines'
+                    : 'Save speaker names & refresh storylines'}
+              </button>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={() => (speakerTranscriptOpen
+                  ? setSpeakerTranscriptOpen(false)
+                  : loadSpeakerTranscript(0))}
+                disabled={speakerTranscriptLoading || rediscovering}
+              >
+                {speakerTranscriptLoading
+                  ? 'Loading transcript…'
+                  : speakerTranscriptOpen
+                    ? 'Hide speaker turn review'
+                    : 'Review & correct transcript speaker turns'}
+              </button>
+              {speakerTranscriptOpen && (
+                <div className="auto-story-transcript-review">
+                  <p className="auto-story-help">
+                    Each row groups neighboring transcript words. Change a row to reassign that complete dialogue turn; changes are saved in this project and used for story discovery and rendering.
+                  </p>
+                  <label className="auto-story-audio-preview">
+                    <span>Episode audio for turn preview</span>
+                    <audio
+                      ref={speakerPreviewRef}
+                      controls
+                      preload="metadata"
+                      src={`/api/auto-story/${encodeURIComponent(jobId)}/source`}
+                      onTimeUpdate={stopSpeakerPreviewAtTurnEnd}
+                      onEnded={() => setActiveSpeakerPreview('')}
+                      onError={() => {
+                        setActiveSpeakerPreview('')
+                        setError('Could not load the uploaded episode audio. Restore the project source and try again.')
+                      }}
+                    />
+                  </label>
+                  <div className="auto-story-turn-list">
+                    {speakerTranscriptTurns.map(turn => {
+                      let displayedSpeakerId = turn.speaker_id || ''
+                      while (speakerMergeDraft[displayedSpeakerId]) {
+                        displayedSpeakerId = speakerMergeDraft[displayedSpeakerId]
+                      }
+                      return (
+                        <div className="auto-story-turn-row" key={`${turn.start_word_id}-${turn.end_word_id}`}>
+                          <span className="auto-story-turn-time">
+                            {turn.start_sec.toFixed(1)}s–{turn.end_sec.toFixed(1)}s
+                          </span>
+                          <span className="auto-story-turn-text">{turn.text}</span>
+                          <select
+                            className="form-select"
+                            aria-label={`Assign speaker for transcript turn starting ${turn.start_sec.toFixed(1)} seconds`}
+                            value={displayedSpeakerId}
+                            onChange={event => updateSpeakerTurn(turn, event.target.value)}
+                          >
+                            <option value="">Unassigned</option>
+                            {canonicalSpeakerIds.map(speakerId => (
+                              <option value={speakerId} key={speakerId}>
+                                {speakerNameDraft[speakerId] || speakerId}
+                              </option>
+                            ))}
+                          </select>
+                          <button
+                            type="button"
+                            className="btn btn-ghost btn-sm"
+                            onClick={() => previewSpeakerTurn(turn)}
+                            aria-label={`Play audio from ${turn.start_sec.toFixed(1)} to ${turn.end_sec.toFixed(1)} seconds`}
+                          >
+                            {activeSpeakerPreview === `${turn.start_word_id}-${turn.end_word_id}` ? 'Playing turn…' : 'Play turn'}
+                          </button>
+                        </div>
+                      )
+                    })}
+                  </div>
+                  {speakerTranscriptOffset < speakerTranscriptTotal && (
+                    <button
+                      type="button"
+                      className="btn btn-ghost"
+                      onClick={() => loadSpeakerTranscript(speakerTranscriptOffset)}
+                      disabled={speakerTranscriptLoading}
+                    >
+                      Load more turns ({speakerTranscriptTurns.length} of {speakerTranscriptTotal})
+                    </button>
+                  )}
+                  {!!speakerCorrections.length && (
+                    <p className="auto-story-help" role="status">
+                      {speakerCorrections.length} speaker turn edit(s) will be saved with this project.
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+          <label className="auto-story-review-choice">
+            <input
+              type="checkbox"
+              checked={reviewBeforeRender}
+              onChange={event => setReviewBeforeRender(event.target.checked)}
+            />
+            <span>Let me review and adjust dialogue timing before rendering</span>
+          </label>
           {state.failed_stories?.length > 0 && (
             <div className="auto-story-warning" role="status">
               <strong>Some storylines failed automatic scheduling.</strong>
@@ -652,6 +1356,14 @@ function AutoStory() {
                 {state.failed_stories.map(story => (
                   <li key={story.storyline_id}>
                     <strong>{story.title}:</strong> {story.reason}
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-sm"
+                      onClick={() => retryFailedStory(story.storyline_id)}
+                      disabled={Boolean(retryingStorylineId) || selecting || rediscovering}
+                    >
+                      {retryingStorylineId === story.storyline_id ? 'Retrying…' : 'Retry this story'}
+                    </button>
                   </li>
                 ))}
               </ul>
@@ -701,11 +1413,18 @@ function AutoStory() {
               type="button"
               className="btn btn-primary"
               onClick={createSelectedStories}
-              disabled={!selectedStorylineIds.length || selecting || rediscovering}
+              disabled={
+                !selectedStorylineIds.length
+                || selecting
+                || rediscovering
+                || speakerEditsDirty
+              }
             >
               {selecting
                 ? <><span className="spinner"></span> Creating stories…</>
-                : `✅ Create & render ${selectedStorylineIds.length} ${selectedStorylineIds.length === 1 ? 'story' : 'stories'}`}
+                : reviewBeforeRender
+                  ? `Create ${selectedStorylineIds.length} ${selectedStorylineIds.length === 1 ? 'story plan' : 'story plans'}`
+                  : `✅ Create & render ${selectedStorylineIds.length} ${selectedStorylineIds.length === 1 ? 'story' : 'stories'}`}
             </button>
           </div>
         </section>
@@ -717,6 +1436,18 @@ function AutoStory() {
           <p className="auto-story-help">
             This job uses the earlier single-story workflow. Its schedule was prechecked; timing changes need a new validation.
           </p>
+          <label className="auto-story-audio-preview">
+            <span>Episode audio preview</span>
+            <audio
+              ref={speakerPreviewRef}
+              controls
+              preload="metadata"
+              src={`/api/auto-story/${encodeURIComponent(jobId)}/source`}
+              onTimeUpdate={stopSpeakerPreviewAtTurnEnd}
+              onEnded={() => setActiveSpeakerPreview('')}
+              onError={() => setError('Could not load the uploaded episode audio. Restore the project source and try again.')}
+            />
+          </label>
           <div className="auto-story-beats">
             {legacyRecipe.beats?.map((beat, beatIndex) => (
               <article className="card auto-story-beat" key={beat.beat_id || beatIndex}>
@@ -727,6 +1458,20 @@ function AutoStory() {
                     Speaker: {beat.speaker_ids?.join(', ') || 'Not identified'}
                   </span>
                 </div>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => {
+                    const padding = Number(legacyRecipe.settings?.padding_sec || 0)
+                    previewSourceInterval(
+                      Number(beat.dialogue_start_sec) - padding,
+                      Number(beat.dialogue_end_sec) + padding,
+                      `legacy-${beatIndex}`,
+                    )
+                  }}
+                >
+                  {activeSpeakerPreview === `legacy-${beatIndex}` ? 'Playing beat…' : 'Preview beat with context'}
+                </button>
                 <div className="auto-story-time-fields">
                   {[
                     { key: 'start', field: 'dialogue_start_sec', label: 'Start (seconds)' },
@@ -798,10 +1543,25 @@ function AutoStory() {
       {job.status === 'awaiting_recipe' && stories.length > 0 && (
         <section className="auto-story-section">
           <h3>3. Review the complete story plan</h3>
+          <a className="btn btn-secondary" href={`/api/auto-story/${encodeURIComponent(jobId)}/project`}>
+            Download project backup
+          </a>
           <p className="auto-story-help">
             All {stories.length} narrative arcs and dialogue schedules have been created and checked before rendering.
             Review them together. Reconstruct any one story without changing the others, or adjust word-boundary timings.
           </p>
+          <label className="auto-story-audio-preview">
+            <span>Episode audio preview</span>
+            <audio
+              ref={speakerPreviewRef}
+              controls
+              preload="metadata"
+              src={`/api/auto-story/${encodeURIComponent(jobId)}/source`}
+              onTimeUpdate={stopSpeakerPreviewAtTurnEnd}
+              onEnded={() => setActiveSpeakerPreview('')}
+              onError={() => setError('Could not load the uploaded episode audio. Restore the project source and try again.')}
+            />
+          </label>
           <div className="auto-story-plan-list">
             {stories.map((story, storyIndex) => (
               <article className="card auto-story-storyline auto-story-plan" key={story.story_id}>
@@ -845,6 +1605,22 @@ function AutoStory() {
                           </span>
                         </div>
                       </div>
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-sm"
+                        onClick={() => {
+                          const padding = Number(story.recipe.settings?.padding_sec || 0)
+                          previewSourceInterval(
+                            Number(beat.dialogue_start_sec) - padding,
+                            Number(beat.dialogue_end_sec) + padding,
+                            `${story.story_id}-${beatIndex}`,
+                          )
+                        }}
+                      >
+                        {activeSpeakerPreview === `${story.story_id}-${beatIndex}`
+                          ? 'Playing beat…'
+                          : 'Preview beat with context'}
+                      </button>
                       <div className="auto-story-time-fields">
                         {[
                           { key: 'start', field: 'dialogue_start_sec', label: 'Start (seconds)' },
@@ -918,6 +1694,19 @@ function AutoStory() {
       {job.status === 'completed' && (
         <section className="auto-story-section">
           <h3>Your stories are ready</h3>
+          <a className="btn btn-secondary" href={`/api/auto-story/${encodeURIComponent(jobId)}/project`}>
+            Download portable project backup
+          </a>
+          {state.stories?.length > 0 && (
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={editCompletedProject}
+              disabled={reopeningReview}
+            >
+              {reopeningReview ? 'Opening saved plan…' : 'Edit plans & render again'}
+            </button>
+          )}
           {state.failed_stories?.length > 0 && (
             <div className="auto-story-warning" role="status">
               <strong>
@@ -931,6 +1720,14 @@ function AutoStory() {
                 {state.failed_stories.map(story => (
                   <li key={story.storyline_id}>
                     <strong>{story.title}:</strong> {story.reason}
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => retryFailedStory(story.storyline_id)}
+                      disabled={Boolean(retryingStorylineId)}
+                    >
+                      {retryingStorylineId === story.storyline_id ? 'Retrying…' : 'Retry this story'}
+                    </button>
                   </li>
                 ))}
               </ul>
@@ -976,6 +1773,27 @@ function AutoStory() {
 
       {job.status === 'failed' && (
         <section className="auto-story-section">
+          <a className="btn btn-secondary" href={`/api/auto-story/${encodeURIComponent(jobId)}/project`}>
+            Download project backup
+          </a>
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={retryDiscoveryFromCache}
+            disabled={retryingDiscovery}
+          >
+            {retryingDiscovery ? 'Retrying from saved analysis…' : 'Retry Auto Story (reuse saved analysis when available)'}
+          </button>
+          {canRetryRender && (
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={retryRenderFromPlan}
+              disabled={retryingRender}
+            >
+              {retryingRender ? 'Resuming render…' : 'Retry rendering from saved plan'}
+            </button>
+          )}
           {state.failed_stories?.length > 0 && (
             <div className="auto-story-warning">
               <h3>Could not schedule the selected stories</h3>
@@ -1006,6 +1824,37 @@ function AutoStory() {
             </div>
           )}
           <Link to="/auto-story" className="btn btn-primary">Start another Auto Story</Link>
+        </section>
+      )}
+
+      {job.status === 'cancelled' && (
+        <section className="auto-story-section">
+          <h3>Processing was cancelled</h3>
+          <p className="auto-story-help">
+            Download a backup now, or continue with the saved transcript and speaker analysis when available.
+          </p>
+          <a className="btn btn-secondary" href={`/api/auto-story/${encodeURIComponent(jobId)}/project`}>
+            Download project backup
+          </a>
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={retryDiscoveryFromCache}
+            disabled={retryingDiscovery}
+          >
+            {retryingDiscovery ? 'Retrying…' : 'Continue project'}
+          </button>
+          {canRetryRender && (
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={retryRenderFromPlan}
+              disabled={retryingRender}
+            >
+              {retryingRender ? 'Resuming render…' : 'Resume rendering from saved plan'}
+            </button>
+          )}
+          {error && <div className="auto-story-error" role="alert">{error}</div>}
         </section>
       )}
     </div>

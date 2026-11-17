@@ -10,9 +10,32 @@ All notable changes to the **OpenSource Clipping** project will be documented in
 ## [Unreleased]
 
 ### Added
+- **Auto Story restart recovery**: Resume analysis, planning, single story selection, reconstruction, failed story retries, and rendering from saved local checkpoints after backend restart; retain completed render outputs.
+- **In-progress recovery backups**: Download a portable source and analysis checkpoint during transcription, diarization, or discovery; defer backup during rendering to avoid partial output files.
+- **Auto Story pacing control**: Choose a validated 15–60 second minimum gap between source moments; preserve it through worker configuration and portable project export/import, with 30 seconds as the default.
+- **Auto Story speaker context**: Explain diarization labels and allow optional speaker names before story selection; discovery uses those names while preserving the original speaker assignments.
+- **Auto Story transcript correction**: Review transcript turns in pages, reassign each complete turn to a detected speaker or mark it unassigned, then rerun discovery and apply corrections to planning and rendering.
+- **Auto Story project library**: Find saved projects by name, source filename, job ID, or status; reopen failed/completed work and download a portable backup from the dashboard.
+- **Auto Story transfer and polling recovery**: Show upload/import progress, allow transfer cancellation, and keep status polling alive through temporary network interruptions.
 - **Kaggle Auto Story GPU workflow**: Use the Auto Story dashboard against the Kaggle backend, select CUDA for Faster-Whisper when available, and document the local-dashboard-to-Kaggle tunnel setup.
 - **Auto Story word-step timing controls**: Adjust beat edges by one cached transcript word at a time using exact word timestamps, while preserving manual time entry.
 - **Auto Story resilient beat scheduling**: Request progressively broader AI candidate pools, retry with a recorded 15-second pacing fallback when strict spacing fails, and validate each schedule before rendering.
+- **Auto Story content-addressed transcript cache**: Persist word transcripts and PyAnnote speaker turns by video-content hash so repeat jobs and identical re-uploads reuse expensive analysis; migrate matching legacy caches when the original uploaded source files remain available.
+- **Optional Auto Story manual review**: Keep automatic story creation and rendering as the default, with an opt-in review step for editing dialogue word timings before rendering.
+- **Portable Auto Story project backups**: Export and restore a project archive containing its episode, transcript/speaker cache, plans, and generated files; retry failed discovery from saved analysis.
+- **Reopen saved Auto Story plans**: Re-enter manual timing review on completed projects when their source and cached transcript are available.
+- **Auto Story provider resilience**: Retry transient Gemini/NVIDIA service errors with bounded backoff and automatically correct one semantically invalid storyline response before returning discovery to the user.
+- **Auto Story stage-specific recovery**: Persist the post-diarization checkpoint, identify which discovery stage failed, and keep cached analysis available for retry after backend restart.
+- **Auto Story dashboard responsiveness**: Show cancellable byte progress for large episode/project uploads, validate size before transfer, and keep status polling alive with backoff after connection errors while reducing idle poll rerenders.
+- **Auto Story failed-story retry**: Retry one failed storyline from its saved transcript, keep successful story files intact, regenerate the project manifest, and reject retries when the uploaded episode changed. Cancellation preserves completed outputs.
+- **Auto Story diarization review audio**: Stream the saved episode with HTTP byte ranges and let users audition each transcript turn directly from the speaker-correction list before changing its label.
+- **Auto Story speaker identity merges**: Merge duplicate PyAnnote labels into one canonical speaker before rediscovery; apply merges to transcript turns, AI context, planning cache identity, and portable project backups with cycle and unknown-label validation.
+- **Auto Story beat preview**: Audition each reviewed beat from the uploaded episode, including its configured context padding, in both legacy and multi-story timing review.
+- **Auto Story safe diagnostics**: Track cache reuse and stage elapsed time, record safe error categories, and add a per-project JSON download with source/cache/output availability while omitting transcript data, credentials, raw provider errors, and local paths.
+- **Job-store persistence health**: Surface local snapshot read/write failures to clients, mark health degraded, and prevent new writes from replacing an unreadable existing job index; retry transient write failures on later updates.
+- **Auto Story diarization control**: Let users keep PyAnnote speaker count automatic or specify an expected count from 1 to 16; preserve the setting in backups and reuse word transcription while the diarization cache key changes.
+- **Auto Story project library performance**: Search and paginate compact project summaries on the server without deep-copying full job histories; the dashboard debounces search and loads additional pages on demand.
+- **Auto Story transcription model control**: Offer validated Faster-Whisper tiny/base/small/medium/large-v3/large-v3-turbo choices, preserve selection in backups, and reuse the model-specific transcript cache when available.
 - **Auto Story variable multi-story workflow**: Discover as many supported story arcs as the episode allows (up to eight), let users select any non-empty subset or rerun discovery, then create and render selected stories automatically. Unbuildable or unrenderable arcs are reported and skipped while other selected stories continue.
 - **Auto Story-Recipe dashboard workflow**: Add a guided Studio page and staged API workflow for uploading an episode, discovering possible storylines, and selecting one or more stories. The existing CLI review workflow remains available. Faster-Whisper word timestamps, PyAnnote speaker turns, and Gemini/NVIDIA pass results remain cached.
 - **Auto Story transcription progress and resilience**: Reflect Faster-Whisper audio progress in the dashboard and continue when an isolated word has a zero-length timestamp, with a terminal warning; invalid or reversed timestamps still fail explicitly.

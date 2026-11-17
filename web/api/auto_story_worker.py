@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
+import time
 from urllib.parse import quote
 
 from clipping import auto_story as pipeline
@@ -16,6 +16,7 @@ from .models import JobStatus
 
 _tasks: dict[str, asyncio.Task] = {}
 _TOTAL_STEPS = 4
+_MAX_CORRECTED_TRANSCRIPT_WORDS = 100_000
 
 
 def _job(job_id: str) -> dict:
@@ -36,6 +37,8 @@ def _build_config(job: dict):
         "upload_filename": job.get("upload_filename"),
         "ai_provider": settings.get("ai_provider", "gemini"),
         "target_duration_sec": settings.get("target_duration_sec", 60),
+        "min_gap_sec": settings.get("min_gap_sec", 30),
+        "diarization_speakers": settings.get("diarization_speakers") or "auto",
         "auto_story_mode": True,
         "auto_story_whisper_model": settings.get("auto_story_whisper_model", "small"),
         "auto_story_whisper_device": settings.get("auto_story_whisper_device", "cpu"),
@@ -62,9 +65,27 @@ def _source_context(job: dict) -> dict:
     if not os.path.isfile(video_path):
         raise FileNotFoundError("Uploaded episode was not found. Upload it again.")
 
-    source_id = "episode-" + hashlib.sha256(
-        upload_filename.encode("utf-8")
-    ).hexdigest()[:12]
+    stat = os.stat(video_path)
+    current_file_stat = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    prior_state = job.get("auto_story") or {}
+    prior_signature = prior_state.get("source_signature")
+    prior_file_stat = prior_state.get("source_file_stat")
+    expected_source_id = prior_state.get("source_id")
+    signature_matches_job = (
+        isinstance(prior_signature, dict)
+        and isinstance(prior_signature.get("content_sha256"), str)
+        and len(prior_signature["content_sha256"]) == 64
+        and prior_signature.get("size") == stat.st_size
+        and isinstance(expected_source_id, str)
+        and expected_source_id == f"episode-{prior_signature['content_sha256'][:24]}"
+    )
+    if prior_file_stat == current_file_stat and signature_matches_job:
+        source_signature = prior_signature
+    else:
+        source_signature = pipeline._file_signature(video_path)
+        stat = os.stat(video_path)
+        current_file_stat = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    source_id = f"episode-{source_signature['content_sha256'][:24]}"
     source = {
         "id": source_id,
         "name": job.get("config", {}).get("source_name") or upload_filename,
@@ -83,6 +104,8 @@ def _source_context(job: dict) -> dict:
     return {
         "cfg": cfg,
         "source_id": source_id,
+        "source_signature": source_signature,
+        "source_file_stat": current_file_stat,
         "source": source,
         "source_registry": {source_id: source},
         "video_path": video_path,
@@ -92,7 +115,7 @@ def _source_context(job: dict) -> dict:
     }
 
 
-def _load_words(state: dict) -> list[dict]:
+def _load_uncorrected_words(state: dict) -> list[dict]:
     source_id = state.get("source_id")
     transcript_key = state.get("transcript_key")
     if not source_id or not transcript_key:
@@ -109,6 +132,171 @@ def _load_words(state: dict) -> list[dict]:
     if cached is None or not isinstance(cached.get("words"), list):
         raise RuntimeError("Cached episode transcript is missing; start a new workflow.")
     return cached["words"]
+
+
+def _load_words(state: dict) -> list[dict]:
+    return _apply_speaker_corrections(_load_uncorrected_words(state), state)
+
+
+def _apply_speaker_corrections(words: list[dict], state: dict) -> list[dict]:
+    corrections = state.get("speaker_corrections") or []
+    speaker_merges = state.get("speaker_merges") or {}
+    if not corrections and not speaker_merges:
+        return words
+    known_speakers = {word.get("speaker_id") for word in words if word.get("speaker_id")}
+    normalized_merges = _normalize_speaker_merges(speaker_merges, known_speakers)
+    corrected = list(words)
+    corrected_word_count = 0
+    for correction in corrections:
+        start_id = correction.get("start_word_id")
+        end_id = correction.get("end_word_id")
+        start = int(start_id[1:]) - 1 if isinstance(start_id, str) and start_id.startswith("W") and start_id[1:].isdigit() else -1
+        end = int(end_id[1:]) - 1 if isinstance(end_id, str) and end_id.startswith("W") and end_id[1:].isdigit() else -1
+        if (
+            start < 0 or end < start or end >= len(words)
+            or words[start].get("word_id") != start_id
+            or words[end].get("word_id") != end_id
+            or end - start > 2000
+        ):
+            raise RuntimeError("Saved speaker corrections do not match the cached transcript.")
+        corrected_word_count += end - start + 1
+        if corrected_word_count > _MAX_CORRECTED_TRANSCRIPT_WORDS:
+            raise RuntimeError("Saved speaker corrections exceed the project edit limit.")
+        speaker_id = correction.get("speaker_id")
+        if speaker_id is not None and speaker_id not in known_speakers:
+            raise RuntimeError("Saved speaker correction refers to an unknown speaker.")
+        for index in range(start, end + 1):
+            corrected[index] = {**corrected[index], "speaker_id": speaker_id}
+    if normalized_merges:
+        corrected = [
+            {
+                **word,
+                "speaker_id": normalized_merges.get(word.get("speaker_id"), word.get("speaker_id")),
+            }
+            for word in corrected
+        ]
+    return corrected
+
+
+def _normalize_speaker_merges(merges: dict, known_speakers: set[str]) -> dict[str, str]:
+    if not isinstance(merges, dict) or len(merges) > 16:
+        raise RuntimeError("Saved speaker merges are invalid.")
+    if any(
+        not isinstance(source, str)
+        or not isinstance(target, str)
+        or source not in known_speakers
+        or target not in known_speakers
+        or source == target
+        for source, target in merges.items()
+    ):
+        raise RuntimeError("Saved speaker merge refers to an unknown or identical speaker.")
+    normalized = {}
+    for source in merges:
+        seen = {source}
+        target = merges[source]
+        while target in merges:
+            if target in seen:
+                raise RuntimeError("Saved speaker merges contain a cycle.")
+            seen.add(target)
+            target = merges[target]
+        if target in seen:
+            raise RuntimeError("Saved speaker merges contain a cycle.")
+        normalized[source] = target
+    return normalized
+
+
+def _speaker_names_for_state(state: dict) -> dict[str, str]:
+    names = state.get("speaker_names") or {}
+    merges = state.get("speaker_merges") or {}
+    if not merges:
+        return names
+    known = set(state.get("speaker_ids") or ())
+    normalized = _normalize_speaker_merges(merges, known)
+    mapped = {}
+    for speaker_id, name in names.items():
+        target = normalized.get(speaker_id, speaker_id)
+        if name and target not in mapped:
+            mapped[target] = name
+    for speaker_id, name in names.items():
+        if speaker_id not in normalized and name:
+            mapped[speaker_id] = name
+    return mapped
+
+
+def _speaker_corrections_key(state: dict) -> str | None:
+    corrections = state.get("speaker_corrections") or []
+    merges = state.get("speaker_merges") or {}
+    return pipeline._digest({"corrections": corrections, "merges": merges}) if corrections or merges else None
+
+
+def _build_speaker_turns(words: list[dict]) -> list[dict]:
+    turns = []
+    for word in words:
+        speaker_id = word.get("speaker_id")
+        if (
+            not turns
+            or turns[-1]["speaker_id"] != speaker_id
+            or float(word["start"]) - turns[-1]["end_sec"] > 1.5
+        ):
+            turns.append({
+                "start_word_id": word["word_id"],
+                "end_word_id": word["word_id"],
+                "speaker_id": speaker_id,
+                "start_sec": float(word["start"]),
+                "end_sec": float(word["end"]),
+                "text": word["word"],
+                "word_count": 1,
+            })
+        else:
+            turn = turns[-1]
+            turn["end_word_id"] = word["word_id"]
+            turn["end_sec"] = float(word["end"])
+            turn["text"] += f" {word['word']}"
+            turn["word_count"] += 1
+    return turns
+
+
+def _page_speaker_turns(
+    words: list[dict], offset: int, limit: int
+) -> tuple[list[dict], int]:
+    page = []
+    total = 0
+    current = None
+
+    def finish_turn() -> None:
+        nonlocal total, current
+        if current is None:
+            return
+        if offset <= total < offset + limit:
+            page.append(current)
+        total += 1
+        current = None
+
+    for word in words:
+        speaker_id = word.get("speaker_id")
+        starts_turn = (
+            current is None
+            or current["speaker_id"] != speaker_id
+            or float(word["start"]) - current["end_sec"] > 1.5
+        )
+        if starts_turn:
+            finish_turn()
+            current = {
+                "start_word_id": word["word_id"],
+                "end_word_id": word["word_id"],
+                "speaker_id": speaker_id,
+                "start_sec": float(word["start"]),
+                "end_sec": float(word["end"]),
+                "text": word["word"],
+                "word_count": 1,
+            }
+        else:
+            current["end_word_id"] = word["word_id"]
+            current["end_sec"] = float(word["end"])
+            current["text"] += f" {word['word']}"
+            current["word_count"] += 1
+    finish_turn()
+    return page, total
 
 
 def _set_progress(
@@ -160,6 +348,7 @@ def _mark_cancelled(job_id: str) -> None:
 def _mark_failed(job_id: str, exc: Exception) -> None:
     state = get_state(job_id)
     state.update(phase="failed", message=str(exc))
+    state["diagnostic_error_type"] = type(exc).__name__
     store.update_job(
         job_id,
         status=JobStatus.FAILED.value,
@@ -181,6 +370,38 @@ def _mark_failed(job_id: str, exc: Exception) -> None:
 def _discover_sync(job_id: str) -> dict:
     job = _job(job_id)
     context = _source_context(job)
+    prior_state = job.get("auto_story") or {}
+    source_changed = bool(
+        prior_state.get("source_id")
+        and prior_state.get("source_id") != context["source_id"]
+    )
+    changed_source_updates = {}
+    if source_changed:
+        changed_source_updates = {
+            "transcript_key": None,
+            "analysis_ready": False,
+            "speaker_ids": [],
+            "speaker_names": {},
+            "speaker_corrections": [],
+            "storylines": [],
+            "story_count": 0,
+            "stories": [],
+            "output_files": [],
+        }
+    _update_state(
+        job_id,
+        source_id=context["source_id"],
+        source_name=context["source"]["name"],
+        source_signature=context["source_signature"],
+        source_file_stat=context["source_file_stat"],
+        phase="episode_preparation",
+        message=(
+            "Episode bytes changed. Rebuilding transcript and speaker analysis for this source."
+            if source_changed
+            else "Checking the episode and selected AI provider."
+        ),
+        **changed_source_updates,
+    )
     cfg = context["cfg"]
     pipeline._provider_model(cfg)
     _check_cancelled(job_id)
@@ -192,6 +413,11 @@ def _discover_sync(job_id: str) -> dict:
         1,
         "Transcribing the episode and identifying speakers. This can take a while.",
         10,
+    )
+    _update_state(
+        job_id,
+        phase="transcription",
+        message="Transcribing the episode and preparing speaker analysis.",
     )
 
     last_progress_percent = 10
@@ -216,6 +442,11 @@ def _discover_sync(job_id: str) -> dict:
 
     def report_pipeline_phase(phase: str) -> None:
         if phase == "diarization":
+            _update_state(
+                job_id,
+                phase="speaker_diarization",
+                message="Transcription is saved. Identifying speakers with PyAnnote.",
+            )
             store.update_progress(
                 job_id,
                 "speaker_diarization",
@@ -225,6 +456,9 @@ def _discover_sync(job_id: str) -> dict:
                 45,
             )
 
+    def report_cache_usage(cache_usage: dict[str, str]) -> None:
+        _update_state(job_id, analysis_cache=cache_usage)
+
     duration = pipeline._probe_duration(context["video_path"])
     words, transcript_key = pipeline._load_or_create_transcript(
         context["video_path"],
@@ -232,13 +466,37 @@ def _discover_sync(job_id: str) -> dict:
         context["auto_cache_dir"],
         cfg,
         duration,
+        source_signature=context["source_signature"],
         progress_callback=report_transcription_progress,
         phase_callback=report_pipeline_phase,
+        cache_callback=report_cache_usage,
     )
     _check_cancelled(job_id)
+    state = get_state(job_id)
+    detected_speaker_ids = {
+        word["speaker_id"] for word in words if word.get("speaker_id")
+    }
+    words = _apply_speaker_corrections(words, state)
+
+    _update_state(
+        job_id,
+        source_id=context["source_id"],
+        source_name=context["source"]["name"],
+        source_duration_sec=duration,
+        transcript_key=transcript_key,
+        source_signature=context["source_signature"],
+        source_file_stat=context["source_file_stat"],
+        speaker_ids=sorted(detected_speaker_ids | {
+            word["speaker_id"] for word in words if word.get("speaker_id")
+        }),
+        analysis_ready=True,
+        phase="storyline_discovery",
+        message="Transcript and speaker labels are saved. Finding storylines.",
+    )
 
     state = get_state(job_id)
     discovery_revision = int(state.get("discovery_revision", 0))
+    speaker_names = _speaker_names_for_state(state)
     _set_progress(
         job_id,
         JobStatus.ANALYZING,
@@ -258,16 +516,21 @@ def _discover_sync(job_id: str) -> dict:
         target_duration_sec=cfg.auto_story_target_duration,
         min_gap_sec=cfg.auto_story_min_gap_sec,
         cache_variant=f"discovery-{discovery_revision}",
+        speaker_names=speaker_names,
+        speaker_corrections_key=_speaker_corrections_key(state),
     )
     return {
         "source_id": context["source_id"],
         "source_name": context["source"]["name"],
         "source_duration_sec": duration,
         "transcript_key": transcript_key,
+        "speaker_names": speaker_names,
         "storylines": storylines,
         "stories": [],
         "story_count": len(storylines),
         "discovery_revision": discovery_revision,
+        "last_failed_stage": None,
+        "diagnostic_error_type": None,
     }
 
 
@@ -276,6 +539,8 @@ def _create_story_plan(
     context: dict,
     arc: dict,
     story_id: str,
+    *,
+    planning_revision: int = 0,
 ) -> dict:
     cfg = context["cfg"]
     words = _load_words(state)
@@ -314,6 +579,9 @@ def _create_story_plan(
                 context["auto_cache_dir"],
                 cfg,
                 candidate_round=candidate_round,
+                planning_revision=planning_revision,
+                speaker_names=_speaker_names_for_state(state),
+                speaker_corrections_key=_speaker_corrections_key(state),
             )
             recipe_path = os.path.join(
                 context["output_dir"],
@@ -398,6 +666,7 @@ def _aggregate_story_validation(stories: list[dict]) -> dict:
 def _create_selected_stories_sync(
     job_id: str,
     storyline_ids: list[str],
+    review_before_render: bool = False,
 ) -> dict:
     job = _job(job_id)
     state = get_state(job_id)
@@ -427,11 +696,12 @@ def _create_selected_stories_sync(
                 state,
                 context,
                 arc,
-                f"story-{len(stories) + 1}",
+                f"story-{index}",
             )
         except ValueError as exc:
             failed_stories.append({
                 "storyline_id": storyline_id,
+                "story_id": f"story-{index}",
                 "title": arc["title"],
                 "reason": str(exc),
             })
@@ -491,6 +761,14 @@ def _create_selected_stories_sync(
             )
         ),
     )
+    if review_before_render:
+        return {
+            "stories": stories,
+            "failed_stories": failed_stories,
+            "validation": _aggregate_story_validation(stories),
+            "phase": "awaiting_recipe",
+            "message": "Review or adjust the planned dialogue before rendering.",
+        }
     return _render_stories_sync(job_id, _job(job_id), state)
 
 
@@ -530,6 +808,8 @@ def _select_beats_sync(job_id: str, storyline_id: str) -> dict:
         state["transcript_key"],
         context["auto_cache_dir"],
         cfg,
+        speaker_names=_speaker_names_for_state(state),
+        speaker_corrections_key=_speaker_corrections_key(state),
     )
     review_path = os.path.join(
         context["output_dir"], f"story_recipe_review_{cache_key[:12]}.json"
@@ -753,6 +1033,8 @@ def _reconstruct_story_sync(
         output_filename=f"storyline_reconstruction_{story_id}_{revision}.json",
         target_duration_sec=context["cfg"].auto_story_target_duration,
         min_gap_sec=context["cfg"].auto_story_min_gap_sec,
+        speaker_names=_speaker_names_for_state(state),
+        speaker_corrections_key=_speaker_corrections_key(state),
     )
     arc = dict(alternatives[0])
     arc["id"] = f"{story_id}-reconstruction-{revision}"
@@ -879,6 +1161,10 @@ def _render_story_sync(
 
 def _render_stories_sync(job_id: str, job: dict, state: dict) -> dict:
     context = _source_context(job)
+    if context.get("source_id") != state.get("source_id"):
+        raise RuntimeError(
+            "The uploaded episode changed after analysis. Start a new Auto Story project before rendering."
+        )
     cfg = context["cfg"]
     stories = state["stories"]
     if not state.get("validation") or any(
@@ -891,6 +1177,39 @@ def _render_stories_sync(job_id: str, job: dict, state: dict) -> dict:
     failed_stories = list(state.get("failed_stories", []))
     count = len(stories)
 
+    resume_count = 0
+    if state.get("phase") == "rendering":
+        requested_resume_count = min(
+            max(0, int(state.get("rendered_story_count", 0))), count
+        )
+        for index, story in enumerate(stories[:requested_resume_count]):
+            files = story.get("output_files")
+            if not isinstance(files, list) or not files:
+                break
+            available = True
+            for item in files:
+                filename = item.get("filename") if isinstance(item, dict) else None
+                if not isinstance(filename, str) or os.path.basename(filename) != filename:
+                    available = False
+                    break
+                try:
+                    available = os.path.getsize(
+                        os.path.join(context["output_dir"], filename)
+                    ) > 0
+                except OSError:
+                    available = False
+                if not available:
+                    break
+            if not available:
+                break
+            resume_count = index + 1
+        rendered_stories = list(stories[:resume_count])
+        output_files = [
+            item
+            for story in rendered_stories
+            for item in story.get("output_files", [])
+        ]
+
     def output_file(filename: str) -> dict:
         return {
             "filename": filename,
@@ -900,13 +1219,15 @@ def _render_stories_sync(job_id: str, job: dict, state: dict) -> dict:
             ),
         }
 
-    for index, story in enumerate(stories, 1):
+    for index in range(resume_count, count):
+        story = stories[index]
+        arc = story["storyline"]
         _check_cancelled(job_id)
         try:
             rendered_story, files = _render_story_sync(
                 job_id,
                 story,
-                index,
+                index + 1,
                 count,
                 state,
                 context,
@@ -916,9 +1237,9 @@ def _render_stories_sync(job_id: str, job: dict, state: dict) -> dict:
         except worker.JobCancelled:
             raise
         except Exception as exc:
-            arc = story["storyline"]
             failed_stories.append({
                 "storyline_id": arc.get("id", story["story_id"]),
+                "story_id": story["story_id"],
                 "title": arc["title"],
                 "reason": f"Rendering failed: {type(exc).__name__}: {exc}",
             })
@@ -955,7 +1276,7 @@ def _render_stories_sync(job_id: str, job: dict, state: dict) -> dict:
             rendered_story_count=len(rendered_stories),
             phase="rendering",
             message=(
-                f"Rendered story {index} of {count}: {arc['title']}."
+                    f"Rendered story {index + 1} of {count}: {arc['title']}."
             ),
         )
 
@@ -1002,12 +1323,170 @@ def _render_stories_sync(job_id: str, job: dict, state: dict) -> dict:
     }
 
 
+def _retry_failed_story_sync(job_id: str, storyline_id: str) -> dict:
+    job = _job(job_id)
+    state = get_state(job_id)
+    context = _source_context(job)
+    if context.get("source_id") != state.get("source_id"):
+        raise RuntimeError(
+            "The uploaded episode changed after analysis. Start a new Auto Story project before retrying."
+        )
+    arc = next(
+        (item for item in state.get("storylines", []) if item.get("id") == storyline_id),
+        None,
+    )
+    failed = next(
+        (item for item in state.get("failed_stories", []) if item.get("storyline_id") == storyline_id),
+        None,
+    )
+    if arc is None or failed is None:
+        raise ValueError("Choose a failed storyline from this project.")
+
+    stories = list(state.get("stories") or [])
+    old_story = next(
+        (item for item in stories if item.get("storyline", {}).get("id") == storyline_id),
+        None,
+    )
+    used_ids = {
+        item.get("story_id") for item in stories
+        if item is not old_story and item.get("story_id")
+    }
+    story_id = failed.get("story_id") or (old_story or {}).get("story_id")
+    if not story_id or story_id in used_ids:
+        story_id = next(
+            (f"story-{index}" for index in range(1, 9) if f"story-{index}" not in used_ids),
+            None,
+        )
+    if story_id is None:
+        raise ValueError("There is no free story slot for this retry.")
+
+    output_dir = context["output_dir"]
+    os.makedirs(output_dir, exist_ok=True)
+    prefix = f"{story_id}_"
+    for filename in os.listdir(output_dir):
+        if filename.startswith(prefix):
+            path = os.path.join(output_dir, filename)
+            if os.path.isfile(path):
+                os.remove(path)
+
+    revision = int((state.get("story_retry_counts") or {}).get(storyline_id, 1))
+    try:
+        planned = _create_story_plan(
+            state,
+            context,
+            arc,
+            story_id,
+            planning_revision=revision,
+        )
+    except ValueError as exc:
+        failed_stories = [
+            {**item, "reason": str(exc), "story_id": story_id}
+            if item.get("storyline_id") == storyline_id else item
+            for item in state.get("failed_stories", [])
+        ]
+        return {
+            "stories": stories,
+            "failed_stories": failed_stories,
+            "output_files": state.get("output_files", []),
+            "validation": _aggregate_story_validation(stories),
+            "retry_story_succeeded": False,
+            "message": f"Could not schedule {arc['title']} again: {exc}",
+        }
+
+    words = _load_words(state)
+    try:
+        rendered_story, _ = _render_story_sync(
+            job_id,
+            planned,
+            len(stories) + 1,
+            max(1, int(state.get("selected_story_count", len(stories) + 1))),
+            state,
+            context,
+            context["cfg"],
+            words,
+        )
+    except worker.JobCancelled:
+        raise
+    except Exception as exc:
+        failed_stories = [
+            {
+                **item,
+                "story_id": story_id,
+                "reason": f"Retry rendering failed: {type(exc).__name__}: {exc}",
+            }
+            if item.get("storyline_id") == storyline_id else item
+            for item in state.get("failed_stories", [])
+        ]
+        return {
+            "stories": stories,
+            "failed_stories": failed_stories,
+            "output_files": state.get("output_files", []),
+            "validation": _aggregate_story_validation(stories),
+            "retry_story_succeeded": False,
+            "message": f"Rendering {arc['title']} failed again: {type(exc).__name__}: {exc}",
+        }
+
+    stories = [item for item in stories if item.get("storyline", {}).get("id") != storyline_id]
+    stories.append(rendered_story)
+    stories.sort(key=lambda item: int(item["story_id"].split("-")[-1]))
+    failed_stories = [
+        item for item in state.get("failed_stories", [])
+        if item.get("storyline_id") != storyline_id
+    ]
+    plan_manifest = {
+        "schema_version": 1,
+        "source_id": state["source_id"],
+        "source_name": state["source_name"],
+        "story_count": len(stories),
+        "selected_story_count": state.get("selected_story_count", len(stories)),
+        "failed_stories": failed_stories,
+        "target_duration_sec_per_story": context["cfg"].auto_story_target_duration,
+        "stories": [
+            {
+                "story_id": story["story_id"],
+                "storyline": story["storyline"],
+                "target_duration_sec": context["cfg"].auto_story_target_duration,
+                "estimated_runtime_sec": story["validation"]["estimated_runtime_sec"],
+                "actual_runtime_sec": story["actual_runtime_sec"],
+                "manifest_file": story["manifest_file"],
+                "video_file": story["manifest"]["video_file"],
+                "recipe_file": story["recipe_filename"],
+            }
+            for story in stories
+        ],
+    }
+    plan_manifest_path = os.path.join(output_dir, "story_plan_manifest.json")
+    pipeline._write_json(plan_manifest_path, plan_manifest)
+    output_files = [
+        item for story in stories for item in story.get("output_files", [])
+        if item.get("filename") != "story_plan_manifest.json"
+    ]
+    output_files.append({
+        "filename": "story_plan_manifest.json",
+        "download_url": f"/api/outputs/{quote(job_id, safe='')}/story_plan_manifest.json",
+    })
+    return {
+        "stories": stories,
+        "failed_stories": failed_stories,
+        "output_files": output_files,
+        "manifest": plan_manifest,
+        "validation": _aggregate_story_validation(stories),
+        "rendered_story_count": len(stories),
+        "retry_story_succeeded": True,
+        "message": f"{arc['title']} was rendered successfully. Other story outputs were preserved.",
+    }
+
+
 def _render_sync(job_id: str) -> dict:
     job = _job(job_id)
     state = get_state(job_id)
     if state.get("stories"):
         return _render_stories_sync(job_id, job, state)
     context = _source_context(job)
+    if context.get("source_id") != state.get("source_id"):
+        raise RuntimeError(
+            "The uploaded episode changed after analysis. Start a new Auto Story project before rendering."
+        )
     cfg = context["cfg"]
     arc = next(
         (
@@ -1089,6 +1568,8 @@ def _render_sync(job_id: str) -> dict:
 
 
 async def _run_stage(job_id: str, stage: str, function, *args) -> None:
+    stage_started = time.perf_counter()
+    stage_outcome = "completed"
     try:
         _check_cancelled(job_id)
         log_event(
@@ -1134,6 +1615,21 @@ async def _run_stage(job_id: str, stage: str, function, *args) -> None:
                 _TOTAL_STEPS,
                 "Review the proposed dialogue beats, then validate them.",
                 75,
+            )
+        elif stage == "generation" and result.get("phase") == "awaiting_recipe":
+            state = _update_state(job_id, **result)
+            store.update_job(
+                job_id,
+                status=JobStatus.AWAITING_RECIPE.value,
+                auto_story=state,
+            )
+            store.update_progress(
+                job_id,
+                "awaiting_recipe",
+                3,
+                _TOTAL_STEPS,
+                state["message"],
+                80,
             )
         elif stage == "generation":
             state = _update_state(job_id, **result, phase="completed")
@@ -1181,6 +1677,36 @@ async def _run_stage(job_id: str, stage: str, function, *args) -> None:
                 state.get("message", "The reconstructed story is ready for review."),
                 80,
             )
+        elif stage == "retry_story":
+            state = get_state(job_id)
+            origin_status = state.get("retry_origin_status")
+            state = _update_state(
+                job_id,
+                **result,
+                phase="completed" if result.get("retry_story_succeeded") or state.get("stories") else "awaiting_storyline",
+            )
+            state.pop("retrying_storyline_id", None)
+            state.pop("retry_origin_status", None)
+            state.pop("retry_story_succeeded", None)
+            status = (
+                JobStatus.COMPLETED.value
+                if result.get("retry_story_succeeded") or state.get("stories")
+                else JobStatus.AWAITING_STORYLINE.value
+            )
+            store.update_job(
+                job_id,
+                status=status,
+                error=None,
+                auto_story=state,
+            )
+            store.update_progress(
+                job_id,
+                "done" if status == JobStatus.COMPLETED.value else "awaiting_storyline",
+                _TOTAL_STEPS if status == JobStatus.COMPLETED.value else 2,
+                _TOTAL_STEPS,
+                state.get("message", "Story retry finished."),
+                100 if status == JobStatus.COMPLETED.value else 65,
+            )
         else:
             state = _update_state(job_id, **result, phase="completed")
             store.update_job(
@@ -1205,13 +1731,57 @@ async def _run_stage(job_id: str, stage: str, function, *args) -> None:
             stage=stage,
         )
     except worker.JobCancelled:
-        _mark_cancelled(job_id)
+        stage_outcome = "cancelled"
+        if stage == "retry_story":
+            state = get_state(job_id)
+            origin_status = state.get("retry_origin_status")
+            state.pop("retrying_storyline_id", None)
+            state.pop("retry_origin_status", None)
+            status = (
+                origin_status
+                if origin_status in {
+                    JobStatus.COMPLETED.value,
+                    JobStatus.AWAITING_STORYLINE.value,
+                }
+                else JobStatus.COMPLETED.value
+                if state.get("stories") else JobStatus.AWAITING_STORYLINE.value
+            )
+            state.update(
+                phase="completed" if status == JobStatus.COMPLETED.value else "awaiting_storyline",
+                message="Story retry cancelled. Existing project outputs were preserved.",
+            )
+            store.update_job(
+                job_id, status=status, error=None, cancel_requested=False,
+                auto_story=state,
+            )
+            store.update_progress(
+                job_id,
+                "done" if status == JobStatus.COMPLETED.value else "awaiting_storyline",
+                _TOTAL_STEPS if status == JobStatus.COMPLETED.value else 2,
+                _TOTAL_STEPS,
+                state["message"],
+                100 if status == JobStatus.COMPLETED.value else 65,
+            )
+        else:
+            _mark_cancelled(job_id)
     except Exception as exc:
+        stage_outcome = "failed"
+        _update_state(job_id, diagnostic_error_type=type(exc).__name__)
         if stage == "discovery":
             state = get_state(job_id)
+            failed_phase = state.get("phase")
+            failure_labels = {
+                "episode_preparation": "Episode or AI provider setup failed",
+                "transcription": "Transcription failed",
+                "speaker_diarization": "Speaker diarization failed",
+                "storyline_discovery": "Storyline AI failed after transcript and speaker analysis were saved",
+            }
+            failure_label = failure_labels.get(failed_phase, "Auto Story discovery failed")
             state.update(
                 phase="awaiting_storyline",
-                message=f"Story discovery failed: {exc}. You can rerun discovery.",
+                last_failed_stage=failed_phase,
+                diagnostic_error_type=type(exc).__name__,
+                message=f"{failure_label}: {exc}. Retry is available; completed transcript and speaker analysis will be reused.",
             )
             store.update_job(
                 job_id,
@@ -1298,8 +1868,55 @@ async def _run_stage(job_id: str, stage: str, function, *args) -> None:
                 level="ERROR",
                 error=exc,
             )
+        elif stage == "retry_story":
+            state = get_state(job_id)
+            origin_status = state.get("retry_origin_status")
+            state.pop("retrying_storyline_id", None)
+            state.pop("retry_origin_status", None)
+            state.update(
+                phase="completed" if state.get("stories") else "awaiting_storyline",
+                message=f"Could not retry this storyline: {type(exc).__name__}: {exc}",
+            )
+            status = (
+                origin_status
+                if origin_status in {JobStatus.COMPLETED.value, JobStatus.AWAITING_STORYLINE.value}
+                else JobStatus.COMPLETED.value if state.get("stories")
+                else JobStatus.AWAITING_STORYLINE.value
+            )
+            store.update_job(
+                job_id,
+                status=status,
+                error=None,
+                auto_story=state,
+            )
+            store.update_progress(
+                job_id,
+                "done" if status == JobStatus.COMPLETED.value else "awaiting_storyline",
+                _TOTAL_STEPS if status == JobStatus.COMPLETED.value else 2,
+                _TOTAL_STEPS,
+                state["message"],
+                100 if status == JobStatus.COMPLETED.value else 65,
+            )
         else:
             _mark_failed(job_id, exc)
+    finally:
+        elapsed_ms = round((time.perf_counter() - stage_started) * 1000, 3)
+        state = get_state(job_id)
+        stage_runs = list(state.get("stage_runs") or [])
+        stage_runs.append({
+            "stage": stage,
+            "elapsed_ms": elapsed_ms,
+            "outcome": stage_outcome,
+        })
+        _update_state(job_id, stage_runs=stage_runs[-50:])
+        log_event(
+            "auto_story_stage_timing",
+            component="auto_story",
+            job_id=job_id,
+            stage=stage,
+            elapsed_ms=elapsed_ms,
+            status=stage_outcome,
+        )
 
 
 def _start(job_id: str, stage: str, function, *args) -> None:
@@ -1320,6 +1937,104 @@ async def submit_discovery(job_id: str) -> None:
     _start(job_id, "discovery", _discover_sync)
 
 
+async def recover_interrupted_auto_story_jobs() -> int:
+    """Resume interrupted Auto Story stages from their durable project checkpoint."""
+    resumable_statuses = {
+        JobStatus.QUEUED.value,
+        JobStatus.DOWNLOADING.value,
+        JobStatus.TRANSCRIBING.value,
+        JobStatus.ANALYZING.value,
+        JobStatus.RENDERING.value,
+    }
+    resumed = 0
+    for job in store.list_jobs():
+        recovery = job.get("restart_recovery")
+        if (
+            not job.get("config", {}).get("auto_story_mode")
+            or not isinstance(recovery, dict)
+            or recovery.get("interrupted_status") not in resumable_statuses
+        ):
+            continue
+        try:
+            source = config_adapter.resolve_upload_path(job.get("upload_filename"))
+        except (TypeError, ValueError):
+            continue
+        if not os.path.isfile(source):
+            continue
+        state = dict(job.get("auto_story") or {})
+        phase = recovery.get("phase")
+        interrupted_status = recovery.get("interrupted_status")
+        message = "Backend restarted. Resuming this project from its saved checkpoint."
+        resume_status = JobStatus.ANALYZING.value
+        if interrupted_status == JobStatus.RENDERING.value or phase == "rendering":
+            if not state.get("stories") and not state.get("recipe"):
+                continue
+            submit, args = submit_render, ()
+            resume_status = JobStatus.RENDERING.value
+            message = "Backend restarted during rendering. Resuming from saved story plans and completed outputs."
+        elif phase in {"creating_stories", "planning"}:
+            selected_ids = state.get("selected_storyline_ids")
+            if not isinstance(selected_ids, list) or not selected_ids:
+                continue
+            submit = submit_storyline_selection
+            args = (selected_ids, bool(state.get("review_before_render", False)))
+            message = "Backend restarted during story planning. Resuming from the saved storyline selection."
+        elif phase == "beat_selection" and state.get("selected_storyline_id"):
+            submit, args = submit_selection, (state["selected_storyline_id"],)
+            message = "Backend restarted during beat selection. Resuming the selected storyline."
+        elif phase == "retrying_story" and state.get("retrying_storyline_id"):
+            submit, args = submit_failed_story_retry, (state["retrying_storyline_id"],)
+            message = "Backend restarted during a story retry. Resuming that story from the saved plan."
+        elif phase == "reconstructing" and state.get("reconstructing_story_id"):
+            story_id = state["reconstructing_story_id"]
+            revision = int((state.get("reconstruction_counts") or {}).get(story_id, 1))
+            submit, args = submit_reconstruction, (story_id, revision)
+            message = "Backend restarted during story reconstruction. Resuming from the saved plan."
+        elif phase in {
+            "queued", "episode_preparation", "transcription",
+            "speaker_diarization", "storyline_discovery", "restart_recovery",
+        } or interrupted_status in {
+            JobStatus.QUEUED.value,
+            JobStatus.DOWNLOADING.value,
+            JobStatus.TRANSCRIBING.value,
+        }:
+            submit, args = submit_discovery, ()
+            message = "Backend restarted during analysis. Resuming from saved transcript and speaker caches."
+        else:
+            continue
+        state["message"] = message
+        store.update_job(
+            job["id"],
+            status=resume_status,
+            error=None,
+            auto_story=state,
+            restart_recovery=None,
+            cancel_requested=False,
+        )
+        store.update_progress(
+            job["id"], "restart_recovery", 1, _TOTAL_STEPS,
+            message, 12,
+        )
+        try:
+            await submit(job["id"], *args)
+        except ValueError:
+            store.update_job(
+                job["id"],
+                status=JobStatus.FAILED.value,
+                error="Automatic restart recovery could not be scheduled. Retry from the saved project.",
+                restart_recovery=recovery,
+            )
+            continue
+        resumed += 1
+        log_event(
+            "auto_story_restart_recovery_started",
+            component="auto_story",
+            job_id=job["id"],
+            stage=phase or "unknown",
+        )
+    return resumed
+
+
 async def submit_selection(job_id: str, storyline_id: str) -> None:
     _start(job_id, "selection", _select_beats_sync, storyline_id)
 
@@ -1327,12 +2042,14 @@ async def submit_selection(job_id: str, storyline_id: str) -> None:
 async def submit_storyline_selection(
     job_id: str,
     storyline_ids: list[str],
+    review_before_render: bool = False,
 ) -> None:
     _start(
         job_id,
         "generation",
         _create_selected_stories_sync,
         storyline_ids,
+        review_before_render,
     )
 
 
@@ -1352,6 +2069,10 @@ async def submit_reconstruction(
         story_id,
         revision,
     )
+
+
+async def submit_failed_story_retry(job_id: str, storyline_id: str) -> None:
+    _start(job_id, "retry_story", _retry_failed_story_sync, storyline_id)
 
 
 async def submit_render(job_id: str) -> None:

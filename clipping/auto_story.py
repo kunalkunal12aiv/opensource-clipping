@@ -8,12 +8,14 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable
 
 PROMPT_VERSION = "auto-story-recipe-v2-multi-story-planning"
 BEAT_PROMPT_VERSION = "auto-story-beats-v3-retry-candidates"
 DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
 AI_TIMEOUT_SECONDS = 900
+AI_REQUEST_MAX_ATTEMPTS = 3
 WORD_BOUNDARY_TOLERANCE = 0.05
 
 
@@ -52,17 +54,124 @@ def _write_cache(path: str, cache_key: str, payload: dict) -> None:
     _write_json(path, {"_cache_key": cache_key, **payload})
 
 
+def _migrate_legacy_transcript_cache(
+    video_path: str,
+    cache_dir: str,
+    source_signature: dict,
+    cfg,
+    transcript_key: str,
+    diarization_key: str,
+) -> tuple[dict | None, dict | None]:
+    if os.path.basename(os.path.dirname(cache_dir)) != "auto_story":
+        return None, None
+
+    cache_root = os.path.dirname(cache_dir)
+    upload_dir = os.path.dirname(os.path.abspath(video_path))
+    video_size = os.path.getsize(video_path)
+    migrated_transcript = None
+    migrated_diarization = None
+
+    for filename in os.listdir(upload_dir):
+        candidate_path = os.path.join(upload_dir, filename)
+        if (
+            not os.path.isfile(candidate_path)
+            or os.path.getsize(candidate_path) != video_size
+        ):
+            continue
+
+        old_source_id = "episode-" + hashlib.sha256(
+            filename.encode("utf-8")
+        ).hexdigest()[:12]
+        old_cache_dir = os.path.join(cache_root, _safe_source_name(old_source_id))
+        old_transcript_path = os.path.join(old_cache_dir, "transcript_words.json")
+        old_diarization_path = os.path.join(old_cache_dir, "speaker_turns.json")
+        if (
+            not os.path.isfile(old_transcript_path)
+            and not os.path.isfile(old_diarization_path)
+        ):
+            continue
+
+        candidate_signature = _file_signature(candidate_path)
+        if candidate_signature != source_signature:
+            continue
+
+        stat = os.stat(candidate_path)
+        legacy_signature = {
+            "path": os.path.normcase(os.path.abspath(candidate_path)),
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+        old_transcript_key = _digest({
+            "schema": 1,
+            "source": legacy_signature,
+            "whisper": {
+                "model": cfg.auto_story_whisper_model,
+                "device": cfg.auto_story_whisper_device,
+                "compute_type": cfg.auto_story_whisper_compute_type,
+                "max_words_per_subtitle": cfg.max_kata_per_subtitle,
+            },
+        })
+        old_diarization_key = _digest({
+            "schema": 1,
+            "source": legacy_signature,
+            "model": DIARIZATION_MODEL,
+        })
+        if migrated_transcript is None and os.path.isfile(old_transcript_path):
+            migrated_transcript = _read_cache(
+                old_transcript_path, old_transcript_key
+            )
+        if migrated_diarization is None and os.path.isfile(old_diarization_path):
+            migrated_diarization = _read_cache(
+                old_diarization_path, old_diarization_key
+            )
+        if migrated_transcript is not None and migrated_diarization is not None:
+            break
+
+    if migrated_transcript is not None:
+        _write_cache(
+            os.path.join(cache_dir, "transcript_words.json"),
+            transcript_key,
+            {
+                key: value
+                for key, value in migrated_transcript.items()
+                if key != "_cache_key"
+            },
+        )
+    if migrated_diarization is not None:
+        _write_cache(
+            os.path.join(cache_dir, "speaker_turns.json"),
+            diarization_key,
+            {
+                key: value
+                for key, value in migrated_diarization.items()
+                if key != "_cache_key"
+            },
+        )
+    if migrated_transcript is not None or migrated_diarization is not None:
+        print("Migrated saved Auto Story transcript/diarization cache for this video.")
+    return migrated_transcript, migrated_diarization
+
+
 def _safe_source_name(source_id: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "_", source_id).strip("._")
     return slug[:60] or "episode"
 
 
 def _file_signature(path: str) -> dict:
-    stat = os.stat(path)
+    before = os.stat(path)
+    content_hash = hashlib.sha256()
+    with open(path, "rb") as source_file:
+        for chunk in iter(lambda: source_file.read(8 * 1024 * 1024), b""):
+            content_hash.update(chunk)
+    after = os.stat(path)
+    if (
+        before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+    ):
+        raise RuntimeError("Episode changed while preparing its transcript cache.")
     return {
-        "path": os.path.normcase(os.path.abspath(path)),
-        "size": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
+        "content_sha256": content_hash.hexdigest(),
+        "size": before.st_size,
     }
 
 
@@ -134,10 +243,13 @@ def _assign_speakers(words: list[dict], turns: list[dict]) -> list[dict]:
     return result
 
 
-def _format_transcript(words: list[dict]) -> str:
+def _format_transcript(
+    words: list[dict], speaker_names: dict[str, str] | None = None
+) -> str:
+    speaker_names = speaker_names or {}
     return "\n".join(
         f"{word['word_id']}|{word['start']:.3f}-{word['end']:.3f}|"
-        f"{word.get('speaker_id') or 'UNKNOWN'}|{word['word']}"
+        f"{speaker_names.get(word.get('speaker_id'), word.get('speaker_id')) or 'UNKNOWN'}|{word['word']}"
         for word in words
     )
 
@@ -149,11 +261,13 @@ def _load_or_create_transcript(
     cfg,
     duration: float,
     *,
+    source_signature: dict | None = None,
     progress_callback: Callable[[float, float], None] | None = None,
     phase_callback: Callable[[str], None] | None = None,
+    cache_callback: Callable[[dict[str, str]], None] | None = None,
 ) -> tuple[list[dict], str]:
     os.makedirs(cache_dir, exist_ok=True)
-    source_signature = _file_signature(video_path)
+    source_signature = source_signature or _file_signature(video_path)
     whisper_settings = {
         "model": cfg.auto_story_whisper_model,
         "device": cfg.auto_story_whisper_device,
@@ -167,14 +281,21 @@ def _load_or_create_transcript(
     })
     transcript_path = os.path.join(cache_dir, "transcript_words.json")
     transcript_cache = _read_cache(transcript_path, transcript_key)
+    cache_usage = {
+        "transcript": "reused" if transcript_cache is not None else "missing",
+        "diarization": "missing",
+        "combined": "missing",
+    }
 
     diarization_key = _digest({
         "schema": 1,
         "source": source_signature,
         "model": DIARIZATION_MODEL,
+        "num_speakers": getattr(cfg, "diarization_num_speakers", "auto"),
     })
     diarization_path = os.path.join(cache_dir, "speaker_turns.json")
     diarization_cache = _read_cache(diarization_path, diarization_key)
+    cache_usage["diarization"] = "reused" if diarization_cache is not None else "missing"
 
     combined_key = _digest({
         "schema": 1,
@@ -184,7 +305,41 @@ def _load_or_create_transcript(
     combined_path = os.path.join(cache_dir, "combined_transcript.json")
     combined_cache = _read_cache(combined_path, combined_key)
     if combined_cache is not None:
+        cache_usage["combined"] = "reused"
+        if cache_callback is not None:
+            cache_callback(dict(cache_usage))
         return combined_cache["words"], combined_key
+
+    if transcript_cache is None or diarization_cache is None:
+        migrated_transcript, migrated_diarization = _migrate_legacy_transcript_cache(
+            video_path,
+            cache_dir,
+            source_signature,
+            cfg,
+            transcript_key,
+            diarization_key,
+        )
+        if transcript_cache is None:
+            transcript_cache = migrated_transcript
+            if transcript_cache is not None:
+                cache_usage["transcript"] = "migrated"
+        if diarization_cache is None:
+            diarization_cache = migrated_diarization
+            if diarization_cache is not None:
+                cache_usage["diarization"] = "migrated"
+
+    if transcript_cache is not None and diarization_cache is not None:
+        words = _assign_speakers(
+            transcript_cache["words"], diarization_cache["speaker_turns"]
+        )
+        _write_cache(combined_path, combined_key, {"words": words})
+        cache_usage["combined"] = "created"
+        if cache_callback is not None:
+            cache_callback(dict(cache_usage))
+        return words, combined_key
+
+    if cache_callback is not None:
+        cache_callback(dict(cache_usage))
 
     if diarization_cache is None and not cfg.hf_token:
         raise RuntimeError(
@@ -212,6 +367,9 @@ def _load_or_create_transcript(
         )
         transcript_cache = {"words": _flatten_words(segments)}
         _write_cache(transcript_path, transcript_key, transcript_cache)
+        cache_usage["transcript"] = "created"
+        if cache_callback is not None:
+            cache_callback(dict(cache_usage))
 
     if diarization_cache is None:
         from . import diarization
@@ -236,6 +394,9 @@ def _load_or_create_transcript(
                 os.remove(audio_path)
         diarization_cache = {"speaker_turns": turns}
         _write_cache(diarization_path, diarization_key, diarization_cache)
+        cache_usage["diarization"] = "created"
+        if cache_callback is not None:
+            cache_callback(dict(cache_usage))
 
     words = _assign_speakers(
         transcript_cache["words"], diarization_cache["speaker_turns"]
@@ -247,6 +408,9 @@ def _load_or_create_transcript(
         "words": words,
     }
     _write_cache(combined_path, combined_key, combined_cache)
+    cache_usage["combined"] = "created"
+    if cache_callback is not None:
+        cache_callback(dict(cache_usage))
     return combined_cache["words"], combined_key
 
 
@@ -281,33 +445,49 @@ def _request_json(prompt: str, schema: dict, cfg) -> dict:
                 retry_options=types.HttpRetryOptions(attempts=1),
             ),
         )
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=schema,
-            ),
-        )
+        response = None
+        for attempt in range(AI_REQUEST_MAX_ATTEMPTS):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=schema,
+                    ),
+                )
+                break
+            except Exception as exc:
+                if attempt + 1 >= AI_REQUEST_MAX_ATTEMPTS or not _is_retryable_ai_error(exc):
+                    raise
+                time.sleep(2 ** attempt)
         response_text = getattr(response, "text", None)
     else:
         import requests
 
-        response = requests.post(
-            "https://integrate.api.nvidia.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {cfg.api_key_nvidia}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"},
-                "temperature": 0.2,
-            },
-            timeout=AI_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
+        response = None
+        for attempt in range(AI_REQUEST_MAX_ATTEMPTS):
+            try:
+                response = requests.post(
+                    "https://integrate.api.nvidia.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {cfg.api_key_nvidia}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "response_format": {"type": "json_object"},
+                        "temperature": 0.2,
+                    },
+                    timeout=AI_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                break
+            except Exception as exc:
+                if attempt + 1 >= AI_REQUEST_MAX_ATTEMPTS or not _is_retryable_ai_error(exc):
+                    raise
+                time.sleep(2 ** attempt)
         response_text = response.json()["choices"][0]["message"]["content"]
 
     if not isinstance(response_text, str) or not response_text.strip():
@@ -319,6 +499,25 @@ def _request_json(prompt: str, schema: dict, cfg) -> dict:
     if not isinstance(result, dict):
         raise RuntimeError(f"{provider} response must be a JSON object.")
     return result
+
+
+def _is_retryable_ai_error(exc: Exception) -> bool:
+    """Retry transient provider errors, never auth or request/configuration errors."""
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        status = None
+    if status is not None:
+        return status == 429 or status >= 500
+    name = type(exc).__name__.lower()
+    return any(token in name for token in (
+        "timeout", "connectionerror", "connectionreset", "serviceunavailable",
+        "resourceexhausted", "deadlineexceeded", "internalservererror",
+    ))
 
 
 _STORYLINES_SCHEMA = {
@@ -705,6 +904,8 @@ def _discover_storylines(
     output_filename: str = "storyline_discovery.json",
     target_duration_sec: int | None = None,
     min_gap_sec: float | None = None,
+    speaker_names: dict[str, str] | None = None,
+    speaker_corrections_key: str | None = None,
 ) -> list[dict]:
     provider, model = _provider_model(cfg)
     exclusions = [
@@ -724,6 +925,8 @@ def _discover_storylines(
         "target_duration_sec": target_duration_sec,
         "min_gap_sec": min_gap_sec,
         "transcript": transcript_key,
+        "speaker_names": speaker_names or {},
+        "speaker_corrections": speaker_corrections_key,
         "provider": provider,
         "model": model,
     })
@@ -763,11 +966,28 @@ def _discover_storylines(
             )
             + f"Episode duration: {duration:.3f} seconds.\n"
             + "Speaker-labeled word transcript (ID|start-end seconds|speaker|word):\n"
-            + f"{_format_transcript(words)}"
+            + f"{_format_transcript(words, speaker_names)}"
         )
-        response = _request_json(prompt, _STORYLINES_SCHEMA, cfg)
-        cached = {"storylines": response.get("storylines")}
-        _validate_storylines(cached, words, count, excluded_storylines)
+        validation_error = None
+        for correction_attempt in range(2):
+            request_prompt = prompt
+            if validation_error:
+                request_prompt += (
+                    "\n\nYour previous response failed validation: "
+                    f"{validation_error}. Return corrected storylines using only "
+                    "the exact word IDs from the supplied transcript."
+                )
+            response = _request_json(request_prompt, _STORYLINES_SCHEMA, cfg)
+            candidate = {"storylines": response.get("storylines")}
+            try:
+                _validate_storylines(candidate, words, count, excluded_storylines)
+            except ValueError as exc:
+                validation_error = str(exc)
+                if correction_attempt == 1:
+                    raise
+                continue
+            cached = candidate
+            break
         _write_cache(cache_path, cache_key, cached)
 
     storylines = _validate_storylines(
@@ -831,6 +1051,9 @@ def _select_beats(
     cfg,
     *,
     candidate_round: int = 0,
+    planning_revision: int = 0,
+    speaker_names: dict[str, str] | None = None,
+    speaker_corrections_key: str | None = None,
 ) -> tuple[dict, str]:
     provider, model = _provider_model(cfg)
     settings = {
@@ -846,7 +1069,10 @@ def _select_beats(
         "prompt_version": BEAT_PROMPT_VERSION,
         "pass": 2,
         "candidate_round": candidate_round,
+        "planning_revision": planning_revision,
         "transcript": transcript_key,
+        "speaker_names": speaker_names or {},
+        "speaker_corrections": speaker_corrections_key,
         "arc": arc,
         "settings": settings,
         "provider": provider,
@@ -898,7 +1124,7 @@ def _select_beats(
             f"Target duration: {target} seconds; episode duration: "
             f"{episode_duration:.3f} seconds.\n"
             "Eligible speaker-labeled transcript (ID|start-end seconds|speaker|word):\n"
-            f"{_format_transcript(_select_arc_words(arc, words))}"
+            f"{_format_transcript(_select_arc_words(arc, words), speaker_names)}"
         )
         if candidate_round:
             prompt = (

@@ -133,13 +133,15 @@ async def health_check() -> SystemHealthResponse:
     gpu_available, ffmpeg_available = await asyncio.gather(
         asyncio.to_thread(cuda_available), asyncio.to_thread(_check_ffmpeg),
     )
+    persistence = job_store.get_persistence_status()
     return SystemHealthResponse(
-        status="ok",
+        status="ok" if persistence["healthy"] else "degraded",
         version="1.12.0",
         gpu_available=gpu_available,
         ffmpeg_available=ffmpeg_available,
         jobs_running=job_store.get_running_count(),
         jobs_queued=job_store.get_queued_count(),
+        job_store=persistence,
     )
 
 

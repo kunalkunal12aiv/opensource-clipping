@@ -34,6 +34,9 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 PERSIST_PATH = os.path.join(PROJECT_ROOT, "outputs", "jobs.json")
 PERSIST_PATH = os.environ.get("OSC_JOB_STORE_PATH", PERSIST_PATH)
 logger = logging.getLogger(__name__)
+_persistence_error_type: str | None = None
+_persistence_failed_at: str | None = None
+_load_recovery_required = False
 TERMINAL_STATES = {
     JobStatus.COMPLETED.value, JobStatus.FAILED.value, JobStatus.CANCELLED.value,
 }
@@ -47,8 +50,30 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _record_persistence_failure(exc: Exception, *, load_failure: bool = False) -> None:
+    global _persistence_error_type, _persistence_failed_at, _load_recovery_required
+    _persistence_error_type = type(exc).__name__
+    _persistence_failed_at = _now().isoformat()
+    _load_recovery_required = _load_recovery_required or load_failure
+
+
+def get_persistence_status() -> dict:
+    """Return safe health details for the local JSON job snapshot."""
+    with _lock:
+        return {
+            "healthy": _persistence_error_type is None,
+            "error_type": _persistence_error_type,
+            "last_failure_at": _persistence_failed_at,
+            "recovery_required": _load_recovery_required,
+        }
+
+
 def _persist() -> None:
     """Atomically replace the snapshot; callers hold the store lock."""
+    global _persistence_error_type, _persistence_failed_at
+    if _load_recovery_required:
+        logger.error("Could not persist job state because the previous snapshot could not be loaded")
+        return
     temporary_path = None
     try:
         os.makedirs(os.path.dirname(PERSIST_PATH), exist_ok=True)
@@ -79,7 +104,10 @@ def _persist() -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(temporary_path, PERSIST_PATH)
+        _persistence_error_type = None
+        _persistence_failed_at = None
     except Exception as exc:
+        _record_persistence_failure(exc)
         logger.error("Could not persist job state (%s)", type(exc).__name__)
     finally:
         if temporary_path and os.path.exists(temporary_path):
@@ -91,18 +119,52 @@ def _persist() -> None:
 
 def _load() -> None:
     """Load persisted jobs from disk on startup."""
-    global _jobs
+    global _jobs, _persistence_error_type, _persistence_failed_at, _load_recovery_required
     if not os.path.exists(PERSIST_PATH):
         return
     try:
         with open(PERSIST_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
+        if not isinstance(data, dict) or any(
+            not isinstance(jid, str) or not isinstance(entry, dict)
+            for jid, entry in data.items()
+        ):
+            raise ValueError("Invalid persisted job snapshot structure")
+        _load_recovery_required = False
+        _persistence_error_type = None
+        _persistence_failed_at = None
+        loaded_jobs = {}
         recovered = False
         for jid, entry in data.items():
             for key in ("created_at", "updated_at"):
                 if isinstance(entry.get(key), str):
                     entry[key] = datetime.fromisoformat(entry[key])
-            if entry.get("status") not in TERMINAL_STATES:
+            auto_story = entry.get("config", {}).get("auto_story_mode")
+            auto_story_phase = (entry.get("auto_story") or {}).get("phase")
+            checkpoint_statuses = {
+                JobStatus.AWAITING_STORYLINE.value,
+                JobStatus.AWAITING_RECIPE.value,
+            }
+            checkpoint_phase = (
+                auto_story_phase
+                if auto_story_phase in checkpoint_statuses
+                else entry.get("status")
+            )
+            stable_auto_story_checkpoint = bool(
+                auto_story and checkpoint_phase in checkpoint_statuses
+            )
+            if stable_auto_story_checkpoint:
+                # These are durable user checkpoints, not active worker states.
+                entry["status"] = checkpoint_phase
+                entry["error"] = None
+                recovered = True
+            elif entry.get("status") not in TERMINAL_STATES:
+                interrupted_status = entry.get("status")
+                if entry.get("config", {}).get("auto_story_mode"):
+                    entry["restart_recovery"] = {
+                        "interrupted_status": interrupted_status,
+                        "phase": (entry.get("auto_story") or {}).get("phase"),
+                    }
                 entry["status"] = JobStatus.FAILED.value
                 entry["error"] = "Backend restarted before this job finished. Reuse the job to retry."
                 entry["updated_at"] = _now()
@@ -113,10 +175,12 @@ def _load() -> None:
                 )
                 entry.setdefault("log", []).append("[error] " + entry["error"])
                 recovered = True
-            _jobs[jid] = entry
+            loaded_jobs[jid] = entry
+        _jobs.update(loaded_jobs)
         if recovered:
             _persist()
     except Exception as exc:
+        _record_persistence_failure(exc, load_failure=True)
         logger.error("Could not load job state (%s)", type(exc).__name__)
 
 
@@ -175,6 +239,31 @@ def list_jobs() -> list[dict]:
             key=lambda j: j.get("created_at", _now()),
             reverse=True,
         ))
+
+
+def list_auto_story_project_summaries() -> list[dict]:
+    """Read compact project rows without deep-copying full job histories."""
+    with _lock:
+        summaries = []
+        for job in _jobs.values():
+            if not job.get("config", {}).get("auto_story_mode"):
+                continue
+            state = job.get("auto_story") or {}
+            stories = state.get("stories") or []
+            summaries.append({
+                "id": job.get("id"),
+                "status": job.get("status", JobStatus.QUEUED.value),
+                "created_at": job.get("created_at"),
+                "updated_at": job.get("updated_at"),
+                "upload_filename": job.get("upload_filename"),
+                "source_name": state.get("source_name") or job.get("config", {}).get("source_name"),
+                "story_count": state.get("story_count") or len(stories),
+            })
+        return sorted(
+            summaries,
+            key=lambda item: item.get("created_at") or _now(),
+            reverse=True,
+        )
 
 
 def update_job(job_id: str, **kwargs) -> None:
