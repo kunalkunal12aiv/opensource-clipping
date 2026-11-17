@@ -55,9 +55,16 @@ function getDefaultStorylineSelection(autoStory) {
   const failedIds = new Set(
     (autoStory?.failed_stories || []).map(story => story.storyline_id),
   )
-  return (autoStory?.storylines || [])
-    .filter(storyline => !failedIds.has(storyline.id))
-    .map(storyline => storyline.id)
+  const availableIds = new Set(
+    (autoStory?.storylines || [])
+      .filter(storyline => !failedIds.has(storyline.id))
+      .map(storyline => storyline.id),
+  )
+  const savedSelection = (autoStory?.selected_storyline_ids || [])
+    .filter(id => availableIds.has(id))
+  return savedSelection.length
+    ? savedSelection
+    : [...availableIds]
 }
 
 function AutoStory() {
@@ -83,7 +90,9 @@ function AutoStory() {
   const [importProgress, setImportProgress] = useState(0)
   const [importUploadComplete, setImportUploadComplete] = useState(false)
   const [targetDuration, setTargetDuration] = useState(60)
+  const [workflowMode, setWorkflowMode] = useState('auto')
   const [minGapSec, setMinGapSec] = useState(30)
+  const [diarizationEnabled, setDiarizationEnabled] = useState(false)
   const [diarizationSpeakers, setDiarizationSpeakers] = useState('auto')
   const [whisperModel, setWhisperModel] = useState('small')
   const [provider, setProvider] = useState('gemini')
@@ -356,8 +365,10 @@ function AutoStory() {
       const created = await createAutoStory({
         upload_filename: uploadFilename,
         source_name: selectedFile.name,
+        workflow_mode: workflowMode,
         target_duration_sec: Number(targetDuration),
         min_gap_sec: Number(minGapSec),
+        diarization_enabled: diarizationEnabled,
         diarization_speakers: diarizationSpeakers === 'auto' ? null : Number(diarizationSpeakers),
         whisper_model: whisperModel,
         ai_provider: provider,
@@ -828,13 +839,13 @@ function AutoStory() {
     const providerKeySet = provider === 'gemini'
       ? settings?.google_api_key_set
       : settings?.nvidia_api_key_set
-    const readyForStart = Boolean(settings?.hf_token_set && providerKeySet)
+    const readyForStart = Boolean(providerKeySet && (!diarizationEnabled || settings?.hf_token_set))
     return (
       <div className="fade-in">
         <div className="page-header">
           <div>
             <h2>Auto Story</h2>
-            <p>Choose storylines once; Auto Story builds and renders them automatically.</p>
+            <p>Build one dialogue story automatically, or choose storylines for multiple stories.</p>
           </div>
         </div>
 
@@ -978,6 +989,21 @@ function AutoStory() {
           </div>
 
           <div className="card auto-story-card">
+            <div className="form-group">
+              <label className="form-label" htmlFor="auto-story-workflow-mode">Story workflow</label>
+              <select
+                id="auto-story-workflow-mode"
+                className="form-select"
+                value={workflowMode}
+                onChange={event => setWorkflowMode(event.target.value)}
+              >
+                <option value="auto">Auto Story · create one best story (recommended)</option>
+                <option value="choose">Choose a Story · select storylines and create multiple</option>
+              </select>
+              <span className="form-hint">
+                Auto Story creates one story from the strongest supported narrative. Choose a Story keeps the multi-story workflow.
+              </span>
+            </div>
             <h3 className="card-title">2. Set your story length</h3>
             <div className="auto-story-options">
               <div className="form-group">
@@ -1022,12 +1048,26 @@ function AutoStory() {
                 </span>
               </div>
               <div className="form-group">
+                <label className="form-checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={diarizationEnabled}
+                    onChange={event => setDiarizationEnabled(event.target.checked)}
+                  />
+                  <span>Identify speakers with PyAnnote (optional; takes longer)</span>
+                </label>
+                <span className="form-hint">
+                  Story selection works from the dialogue transcript without speaker identities. Enable this to label speakers and review speaker specific scenes.
+                </span>
+              </div>
+              <div className="form-group">
                 <label className="form-label" htmlFor="auto-story-speaker-count">Expected speaker count</label>
                 <select
                   id="auto-story-speaker-count"
                   className="form-select"
                   value={diarizationSpeakers}
                   onChange={event => setDiarizationSpeakers(event.target.value)}
+                  disabled={!diarizationEnabled}
                 >
                   <option value="auto">Automatic (recommended)</option>
                   {Array.from({ length: 16 }, (_, index) => index + 1).map(count => (
@@ -1059,17 +1099,19 @@ function AutoStory() {
               </div>
             </div>
             <div className="auto-story-note">
-              AI discovers the storylines first. You choose which ones to create; then the backend automatically
-              builds, checks, and renders them. Source clips may overlap between different narratives.
+              {workflowMode === 'auto'
+                ? 'The AI finds one promising narrative, selects connected dialogue, and renders one story automatically.'
+                : 'The AI discovers several storylines. Choose which to create; the backend builds and renders each selected story.'}
+              {' '}Speaker identification is optional. The 9:16 renderer tracks the visible subject when possible.
             </div>
             {settingsError && <p className="auto-story-error">{settingsError}</p>}
             {settings && !readyForStart && (
               <div className="auto-story-warning">
-                Before starting, add the selected AI provider key and Hugging Face token in{' '}
-                <Link to="/settings">Studio Settings</Link> and accept the{' '}
-                <a href="https://huggingface.co/pyannote/speaker-diarization-3.1" target="_blank" rel="noopener noreferrer">
-                  PyAnnote model terms
-                </a>.
+                Before starting, add the selected AI provider key{diarizationEnabled && ' and Hugging Face token'} in{' '}
+                <Link to="/settings">Studio Settings</Link>{diarizationEnabled && <> and accept the{' '}
+                  <a href="https://huggingface.co/pyannote/speaker-diarization-3.1" target="_blank" rel="noopener noreferrer">
+                    PyAnnote model terms
+                  </a>.</>}
               </div>
             )}
           </div>
@@ -1080,7 +1122,7 @@ function AutoStory() {
             className="btn btn-primary"
             disabled={creating || uploading || !uploadFilename || !readyForStart}
           >
-            {creating ? <><span className="spinner"></span> Starting…</> : '✨ Find storylines'}
+            {creating ? <><span className="spinner"></span> Starting…</> : workflowMode === 'auto' ? '✨ Create my story' : '✨ Find storylines'}
           </button>
         </form>
       </div>
@@ -1569,6 +1611,7 @@ function AutoStory() {
                   <div>
                     <span className="auto-story-kicker">
                       Story {storyIndex + 1} of {stories.length} · {story.validation?.estimated_runtime_sec?.toFixed(1) || '—'}s planned
+                      {story.settings?.best_effort && ' · Best effort; target not met'}
                     </span>
                     <h4>{story.storyline.title}</h4>
                     <p>{story.storyline.summary}</p>

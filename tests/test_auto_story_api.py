@@ -1,7 +1,9 @@
 """API tests for the dashboard-guided Auto Story workflow."""
 
 import asyncio
+import hashlib
 import json
+import zipfile
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -49,11 +51,33 @@ def test_auto_story_requires_keys_and_uploaded_video(api, monkeypatch):
     monkeypatch.setattr(worker, "_settings_env", {"GOOGLE_API_KEY": "test-key"})
     missing_token = client.post(
         "/api/auto-story",
-        json={"upload_filename": "uploaded_episode.mp4"},
+        json={
+            "upload_filename": "uploaded_episode.mp4",
+            "diarization_enabled": True,
+        },
     )
     assert missing_token.status_code == 400
     assert "HF_TOKEN" in missing_token.json()["detail"]
     assert store.list_jobs() == []
+
+
+def test_auto_story_does_not_require_huggingface_for_dialogue_only_mode(api, monkeypatch):
+    client, _ = api
+    submitted = []
+    monkeypatch.setattr(worker, "_settings_env", {"GOOGLE_API_KEY": "test-key"})
+
+    async def fake_submit(job_id):
+        submitted.append(job_id)
+
+    monkeypatch.setattr(auto_story_worker, "submit_discovery", fake_submit)
+    response = client.post(
+        "/api/auto-story",
+        json={"upload_filename": "uploaded_episode.mp4"},
+    )
+
+    assert response.status_code == 201
+    assert submitted == [response.json()["id"]]
+    assert store.get_job(response.json()["id"])["config"]["diarization_enabled"] is False
 
 
 def test_auto_story_create_uploads_job_and_queues_discovery(api, monkeypatch):
@@ -918,7 +942,7 @@ def test_auto_story_project_export_import_restores_source_cache_and_outputs(
             "target_duration_sec": 60,
             "min_gap_sec": 45,
             "diarization_speakers": 2,
-            "whisper_model": "large-v3-turbo",
+            "auto_story_whisper_model": "large-v3-turbo",
             "ai_provider": "gemini",
             "source_name": "Episode project",
         },
@@ -999,6 +1023,46 @@ def test_auto_story_project_export_import_restores_source_cache_and_outputs(
     assert client.get(
         f"/api/outputs/{restored_id}/story_plan_manifest.json"
     ).status_code == 200
+
+
+def test_auto_story_project_import_defaults_legacy_null_whisper_model(api, monkeypatch):
+    _, project_dir = api
+    outputs_dir = project_dir / "outputs"
+    upload_dir = project_dir / "uploads"
+    monkeypatch.setattr(auto_story_projects, "OUTPUTS_DIR", outputs_dir)
+    monkeypatch.setattr(auto_story_projects, "UPLOAD_DIR", upload_dir)
+    monkeypatch.setattr(files, "OUTPUTS_DIR", str(outputs_dir))
+    source_bytes = b"synthetic source for legacy backup validation"
+    source_id = f"episode-{hashlib.sha256(source_bytes).hexdigest()[:24]}"
+    manifest = {
+        "format": "opensource-clipping-auto-story",
+        "schema_version": 1,
+        "source_id": source_id,
+        "config": {
+            "target_duration_sec": 60,
+            "min_gap_sec": 30,
+            "diarization_speakers": None,
+            "ai_provider": "gemini",
+            "source_name": "Legacy project",
+            "whisper_model": None,
+        },
+        "status": "analyzing",
+        "auto_story": {
+            "phase": "creating_stories",
+            "storylines": [{"id": "arc-1"}, {"id": "arc-2"}],
+            "selected_storyline_ids": ["arc-1", "arc-2"],
+            "stories": [],
+        },
+    }
+    archive_path = project_dir / "legacy-project.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("project.json", json.dumps(manifest))
+        archive.writestr("source/episode.mp4", source_bytes)
+
+    restored_id = auto_story_projects._restore_archive(archive_path)
+
+    assert store.get_job(restored_id)["config"]["auto_story_whisper_model"] == "small"
+    assert store.get_job(restored_id)["config"]["workflow_mode"] == "choose"
 
 
 def test_failed_discovery_can_retry_without_recreating_the_job(api, monkeypatch):
@@ -1354,13 +1418,21 @@ def test_discovery_stage_publishes_storylines_without_blocking_api(api, monkeypa
     job_id = store.create_job(
         upload_filename="uploaded_episode.mp4",
         source="local",
-        config={"auto_story_mode": True},
+        config={"auto_story_mode": True, "workflow_mode": "choose"},
     )
-    store.update_job(job_id, auto_story={"phase": "queued"})
+    store.update_job(
+        job_id,
+        auto_story={
+            "phase": "queued",
+            "selected_storyline_ids": ["stale-arc"],
+            "selected_story_count": 1,
+        },
+    )
     context = {
         "cfg": SimpleNamespace(
             auto_story_target_duration=60,
             auto_story_min_gap_sec=30.0,
+            auto_story_diarization_enabled=True,
         ),
         "source_id": "episode-test",
         "source_signature": {"content_sha256": "test"},
@@ -1435,6 +1507,8 @@ def test_discovery_stage_publishes_storylines_without_blocking_api(api, monkeypa
     assert job["auto_story"]["storylines"] == storylines
     assert job["auto_story"]["stories"] == []
     assert job["auto_story"]["story_count"] == 4
+    assert job["auto_story"]["selected_storyline_ids"] == []
+    assert job["auto_story"]["selected_story_count"] == 0
     assert "Choose which ones to create" in job["auto_story"]["message"]
     assert discovery_options["count"] is None
     assert job["auto_story"]["transcript_key"] == "key"
@@ -1443,6 +1517,39 @@ def test_discovery_stage_publishes_storylines_without_blocking_api(api, monkeypa
     assert job["auto_story"]["stage_runs"][-1]["outcome"] == "completed"
     assert 25.0 in progress_updates
     assert 45 in progress_updates
+
+
+def test_default_auto_workflow_queues_one_story_after_discovery(api, monkeypatch):
+    _, _ = api
+    job_id = store.create_job(
+        upload_filename="uploaded_episode.mp4",
+        source="local",
+        config={"auto_story_mode": True, "workflow_mode": "auto"},
+    )
+    scheduled = []
+    monkeypatch.setattr(
+        auto_story_worker,
+        "_start",
+        lambda *_args: scheduled.append(_args),
+    )
+    result = {"storylines": [{"id": "best-arc", "title": "Best Arc"}], "story_count": 1}
+
+    async def run_stage():
+        task = asyncio.create_task(
+            auto_story_worker._run_stage(
+                job_id, "discovery", lambda _job_id: result
+            )
+        )
+        await task
+        await asyncio.sleep(0)
+
+    asyncio.run(run_stage())
+
+    state = store.get_job(job_id)["auto_story"]
+    assert state["phase"] == "story_planning"
+    assert scheduled and scheduled[0][1] == "generation"
+    assert scheduled[0][3] == ["best-arc"]
+    assert scheduled[0][4] is False
 
 
 def test_storyline_ai_failure_identifies_saved_post_diarization_checkpoint(api, monkeypatch):
@@ -1548,6 +1655,77 @@ def test_story_plan_retries_distinct_candidate_rounds(api, monkeypatch, tmp_path
     assert pacing_profiles == [(30.0, 0.4), (30.0, 0.4), (15.0, 0.2)]
     assert story["validation"]["estimated_runtime_sec"] == 60.0
     assert story["settings"]["min_gap_sec"] == 15.0
+
+
+def test_story_plan_uses_saved_candidates_for_best_effort_export(api, monkeypatch, tmp_path):
+    _, _ = api
+    cfg = SimpleNamespace(
+        auto_story_target_duration=60,
+        auto_story_min_beat_sec=3.5,
+        auto_story_max_beat_sec=6.0,
+        auto_story_min_gap_sec=30.0,
+        auto_story_min_episode_span_ratio=0.4,
+        auto_story_padding_sec=0.18,
+        auto_story_crossfade_ms=60,
+    )
+    state = {
+        "source_id": "episode-test",
+        "source_duration_sec": 3600.0,
+        "transcript_key": "transcript-key",
+    }
+    context = {
+        "cfg": cfg,
+        "auto_cache_dir": str(tmp_path / "cache"),
+        "output_dir": str(tmp_path / "outputs"),
+    }
+    monkeypatch.setattr(
+        auto_story_worker, "_load_words", lambda _state: [{"word_id": "W1"}]
+    )
+    calls = []
+    beat = {
+        "beat_id": 1,
+        "start_word_id": "W1",
+        "end_word_id": "W2",
+        "dialogue_start_sec": 1.0,
+        "dialogue_end_sec": 5.0,
+        "text": "A complete sentence.",
+        "speaker_ids": ["SPEAKER_00"],
+    }
+
+    def select_beats(*_args, **kwargs):
+        calls.append(kwargs)
+        if not kwargs.get("cache_only"):
+            raise ValueError("strict plan not schedulable")
+        return {"beats": [{"start_word_id": "W1", "end_word_id": "W2"}]}, "cache-key"
+
+    monkeypatch.setattr(pipeline, "_select_beats", select_beats)
+    monkeypatch.setattr(
+        pipeline, "_build_review_recipe",
+        lambda _response, _arc, _words, _source, settings: {
+            "beats": [dict(beat)], "settings": settings,
+        },
+    )
+    monkeypatch.setattr(
+        pipeline, "validate_review_recipe",
+        lambda *_args: {
+            "beats": [beat],
+            "estimated_runtime_sec": 4.36,
+            "episode_span_sec": 4.36,
+        },
+    )
+    monkeypatch.setattr(pipeline, "_write_json", lambda *_args: None)
+    monkeypatch.setattr(pipeline, "_build_review_timing_options", lambda *_args: {})
+
+    story = auto_story_worker._create_story_plan(
+        state, context, {"id": "arc-1", "title": "A supported story"}, "story-1"
+    )
+
+    assert len(calls) == 4
+    assert calls[-1]["candidate_round"] == 2
+    assert calls[-1]["best_effort"] is True
+    assert calls[-1]["cache_only"] is True
+    assert story["settings"]["best_effort"] is True
+    assert story["validation"]["estimated_runtime_sec"] == 4.36
 
 
 def test_selected_storylines_are_planned_then_rendered_without_review(api, monkeypatch):
@@ -2209,6 +2387,7 @@ def test_multi_story_render_continues_after_one_story_fails(api, monkeypatch, tm
         auto_story_worker,
         "_source_context",
         lambda _job: {
+            "source_id": "episode-test",
             "cfg": cfg,
             "source_registry": {},
             "cache_dir": str(tmp_path / "cache"),
@@ -2220,6 +2399,7 @@ def test_multi_story_render_continues_after_one_story_fails(api, monkeypatch, tm
         pipeline,
         "validate_review_recipe",
         lambda _recipe, arc, *_args: {
+            "source_id": "episode-test",
             "storyline": arc,
             "target_duration_sec": 60,
             "estimated_runtime_sec": 60.0,

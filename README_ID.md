@@ -790,5 +790,5 @@ Open source. Bebas digunakan, dimodifikasi, dan didistribusikan.
 
 
 
-$env:VITE_API_PROXY_TARGET = "https://<fresh-ngrok-url>"
+$env:VITE_API_PROXY_TARGET = "https://66c4-34-42-29-136.ngrok-free.app"
 npm --prefix web\dashboard run dev -- --host 127.0.0.1

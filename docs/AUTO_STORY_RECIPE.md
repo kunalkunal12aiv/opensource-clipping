@@ -1,20 +1,28 @@
 # Auto Story-Recipe Mode
 
 Auto Story-Recipe creates editor-ready dialogue montages from **one episode
-source**. The Studio asks AI to discover as many distinct narrative arcs as the
-episode supports (up to eight), lets you choose which arcs to create, then
-automatically schedules, validates, and renders each selected story separately.
-The CLI remains a single-story workflow. Source moments may be reused between
-different stories. Auto Story does not generate voice-over or upload videos.
+source**. The default **Auto Story** workflow identifies one promising narrative,
+selects connected dialogue, and renders one story. **Choose a Story** remains an
+advanced workflow that discovers up to eight storylines and lets you create
+multiple stories. A storyline is a candidate arc; the story planner must still
+assemble dialogue that makes sense without episode context. The CLI remains a
+single-story workflow. Source moments may be reused between different stories.
+Auto Story does not generate voice-over or upload videos.
 
 The Studio asks for a story selection once, after discovery:
 
-1. Faster-Whisper creates word timestamps and PyAnnote adds speaker IDs.
-2. The selected AI provider discovers the distinct storylines the transcript
-   supports. If you want another set, rerun discovery before continuing.
-3. Select one or more storylines and continue. The backend builds and validates
-   every selected story, requests fresh dialogue candidates when a schedule
-   cannot fit, and renders the stories sequentially without further approval.
+1. Faster-Whisper creates word timestamps. PyAnnote speaker identification is
+   optional and can be enabled when speaker labels are useful.
+2. In Auto Story mode, the selected provider identifies the strongest supported
+   narrative and plans one connected story. In Choose a Story mode, it discovers
+   several storylines for selection.
+3. The planner favors self-contained dialogue, narrative continuity, distinct
+   story information, and a strong payoff. Requested duration and spacing guide
+   the edit; a valid best-effort draft can still be reviewed and exported when
+   those preferences cannot be met.
+4. Vertical output uses the standard face-tracked crop where possible, while
+   preserving the original source audio. If tracking is unavailable, the renderer
+   falls back to a centered crop.
 
 The CLI still requires choosing one of three storylines, reviewing its recipe
 JSON, and explicitly approving the single montage.
@@ -23,17 +31,19 @@ JSON, and explicitly approving the single montage.
 
 - FFmpeg and `ffprobe` available on `PATH`.
 - The compatible PyAnnote 3.3.2 / PyTorch 2.5.1 / Torchaudio 2.5.1 stack
-  installed from `requirements.txt`.
+  installed from `requirements.txt` only when speaker diarization is enabled.
 - A Hugging Face token in `HF_TOKEN`, with access to
-  `pyannote/speaker-diarization-3.1`. Accept the model's terms on Hugging Face.
+  `pyannote/speaker-diarization-3.1`, only when speaker diarization is enabled.
+  Accept the model's terms on Hugging Face. Story discovery and planning work
+  without diarization; speaker labels are optional context.
 - The key for the explicitly selected AI provider: `GOOGLE_API_KEY` for
   Gemini, or `NVIDIA_API_KEY` for NVIDIA. NVIDIA uses
   `deepseek-ai/deepseek-v4.1-flash` by default.
 - A local video or a source supported by the existing Story Clip downloader.
 
-Put provider keys and `HF_TOKEN` in the git-ignored `.env` file in the project
-root. Auto Story does not fall back to a different provider if the selected key
-is missing.
+Put the selected provider key in the git-ignored `.env` file in the project
+root. Add `HF_TOKEN` only when speaker diarization is enabled. Auto Story does
+not fall back to a different provider if the selected key is missing.
 
 The Auto Story CLI defaults to Faster-Whisper `small` on `cpu` with `int8`.
 The Studio selects CUDA with `float16` when its backend reports a usable NVIDIA
@@ -76,30 +86,37 @@ backend, and the library loads projects in pages so long histories stay responsi
 1. Choose and upload one episode video.
    Upload progress is shown and the transfer can be cancelled; the page also
    rejects files over the 2 GB server limit before uploading.
-2. Choose a 60-, 90-, or 120-second target **per story**, the preferred minimum
-   gap between source moments (30 seconds by default), the AI provider, and the
-   expected speaker count and transcription model. **Small** is the balanced
-   transcription default; lighter models trade accuracy for speed, and the
-   larger models need more memory and time. Device/compute remain automatic.
-   Leave speaker count on **Automatic** unless you
-   know the exact number of voices; forcing a count changes the diarization
-   cache and reruns only that stage when the episode transcript is reusable.
+2. Choose **Auto Story** to make one story from the strongest supported arc, or
+   **Choose a Story** to discover several arcs and select one or more. Choose a
+   60-, 90-, or 120-second target **per story**, the preferred minimum gap
+   between source moments (30 seconds by default), the AI provider, and the
+   transcription model. Turn on speaker diarization only when speaker labels
+   are useful; expected speaker count is available when it is enabled. **Small**
+   is the balanced transcription default; lighter models trade accuracy for
+   speed, and larger models need more memory and time. Device/compute remain
+   automatic. Leave speaker count on **Automatic** unless you know the exact
+   number of voices; forcing a count changes the diarization cache and reruns
+   only that stage when the episode transcript is reusable.
 3. Wait for transcription and story discovery. The dashboard progress bar
-   follows transcript audio progress; speaker identification is a separate step.
-4. Select the storylines you want. All discovered arcs are selected initially;
-   uncheck any you do not want. Choose **Rerun story discovery** for a fresh set,
-   or **Create & render** to build the selected stories automatically. To make
-   manual timing changes, enable **Let me review and adjust dialogue timing
-   before rendering** before continuing. The backend then creates and validates
-   the plans, opens the word-boundary timing editor, and waits for you to check
-   the edited plan and approve rendering.
-5. By default, after selection the backend automatically creates, validates,
-   and renders each story. With manual review enabled, render after reviewing
-   and validating the edited plans. The backend retries beat-candidate
-   generation with progressively broader
-   candidates and a final, recorded 15-second pacing fallback. If an individual
-   storyline still cannot be scheduled, it skips that arc and continues with the
-   others; successful renders are not discarded. The results include a separate
+   follows transcript audio progress; optional speaker identification is a
+   separate step. Auto Story proceeds directly to one best story. Choose a
+   Story opens the storyline-selection step.
+4. In Choose a Story mode, select the arcs to create. All discovered arcs are
+   selected initially; uncheck any you do not want. Choose **Rerun story
+   discovery** for a fresh set, or **Create & render** to build the selected
+   stories. To make manual timing changes, enable **Let me review and adjust
+   dialogue timing before rendering** before continuing. The backend then creates
+   and validates the plans, opens the word-boundary timing editor, and waits for
+   you to check the edited plan and approve rendering.
+5. Auto Story automatically creates, validates, and renders its single story.
+   Choose a Story does the same for each selected arc. With manual review
+   enabled, render after reviewing and validating the edited plans. The backend
+   retries beat-candidate generation with progressively broader candidates.
+   The final candidate pool is also scheduled as a best-effort draft: target
+   runtime, minimum gap, episode span, and preferred beat lengths no longer
+   prevent export when usable dialogue candidates exist. If no candidate pool
+   or renderable dialogue exists, that story is reported as failed; successful
+   renders are not discarded. The results include a separate
    MP4, caption sidecar, and manifest for each rendered story, plus a combined
    plan manifest that records skipped storylines.
 
@@ -149,9 +166,10 @@ failed storyline. The retry reuses saved transcript and speaker corrections,
 requests a fresh planning candidate round, preserves completed story files, and
 updates the project manifest. It is available only while the project source and
 saved analysis still match; cancellation returns to the prior checkpoint.
-Auto Story uses the existing dashboard upload limit of 2 GB. Configure the selected provider key and
-`HF_TOKEN` in **Settings** first. The backend automatically selects CUDA when
-available.
+Auto Story uses the existing dashboard upload limit of 2 GB. Configure the
+selected provider key in **Settings** first. Configure `HF_TOKEN` there only
+when speaker diarization is enabled. The backend automatically selects CUDA
+when available.
 
 ### Save or move an Auto Story project
 
@@ -252,20 +270,20 @@ The CLI continues to write one `story_montage.mp4`, one ASS sidecar, and one
   terminal warning; invalid or reversed timestamps still stop the workflow.
 - Each cut has 180 ms padding by default, with a 60 ms audio/video crossfade
   between cuts. Crossfade is configurable from 50–80 ms.
-- Consecutive beats normally target at least 30 source seconds apart; the Studio
-  retries the final candidate pool with a 15-second gap and half the arc's
-  minimum source-span ratio if strict scheduling fails. The actual settings are
-  recorded in each story manifest. Total output must be within 10% of the target
-  duration. The CLI's first-to-last span must
+- Consecutive beats normally target at least 30 source seconds apart. The Studio
+  first tries the configured schedule, then a wider 15-second fallback, and
+  finally a best-effort schedule that treats runtime, gap, episode span, and beat
+  length as preferences. The actual settings and best-effort status are recorded
+  in the story manifest. A short draft remains exportable when candidates exist.
+  The CLI's first-to-last span must
   cover at least 40% of the episode. For a dashboard story whose arc covers a
   shorter source span, the same ratio is applied to that arc's span. These
   checks are configurable with `--min-gap-sec` and
   `--min-episode-span-ratio`.
 - Scene-boundary detection, active-speaker cropping, Demucs, and TTS are not
-  part of v1. If a selected story still cannot be scheduled after the automatic
-  fallback, the Studio records it as skipped and continues rendering the other
-  selected stories. The job fails only when none of the selected stories can be
-  scheduled or rendering cannot produce any usable output.
+  part of v1. If no usable dialogue candidate pool exists for a selected story,
+  the Studio records that story as failed and continues with the others. The job
+  fails only when no story can produce any usable output.
 
 Transcript and diarization caches are keyed by video content rather than the
 random filename assigned to each upload. When unchanged prior upload files and

@@ -61,7 +61,7 @@ async def create_auto_story(req: AutoStoryCreateRequest) -> JobResponse:
             status_code=400,
             detail=f"Add {provider_key} in Studio Settings before starting Auto Story.",
         )
-    if not _required_key("HF_TOKEN"):
+    if req.diarization_enabled and not _required_key("HF_TOKEN"):
         raise HTTPException(
             status_code=400,
             detail="Add HF_TOKEN in Studio Settings and accept the PyAnnote model terms before starting Auto Story.",
@@ -77,9 +77,11 @@ async def create_auto_story(req: AutoStoryCreateRequest) -> JobResponse:
     use_cuda = await asyncio.to_thread(cuda_available)
     config = {
         "auto_story_mode": True,
+        "workflow_mode": req.workflow_mode,
         "target_duration_sec": req.target_duration_sec,
         "min_gap_sec": req.min_gap_sec,
         "diarization_speakers": req.diarization_speakers,
+        "diarization_enabled": req.diarization_enabled,
         "ai_provider": provider,
         "source_name": req.source_name,
         "auto_story_whisper_model": req.whisper_model,
@@ -96,6 +98,7 @@ async def create_auto_story(req: AutoStoryCreateRequest) -> JobResponse:
         auto_story={
             "phase": "queued",
             "target_duration_sec": req.target_duration_sec,
+            "workflow_mode": req.workflow_mode,
             "story_count": 0,
             "source_name": req.source_name,
             "storylines": [],

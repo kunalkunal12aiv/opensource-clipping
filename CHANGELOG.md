@@ -10,6 +10,12 @@ All notable changes to the **OpenSource Clipping** project will be documented in
 ## [Unreleased]
 
 ### Added
+- **Auto Story default workflow and quality ranking**: Make one best-story workflow the default while retaining Choose a Story multi-story mode; ask the provider to rank context-complete, connected, non-redundant dialogue and stronger payoffs, then use those scores in scheduling.
+- **Optional speaker diarization**: Allow transcript-first story creation without PyAnnote or an HF token; enable diarization when users need speaker labels and preserve the choice in project backups.
+- **Legacy Auto Story restore**: Infer Choose a Story mode for older project backups that contain multiple discovered storylines but no saved workflow setting, preserving the original multi-story intent.
+- **Auto Story subject tracking**: Reuse the standard face-tracked portrait crop for 9:16 and other vertical story scenes, preserve source audio, and use a fill-frame centered crop without letterbox bars if tracking cannot run.
+- **Auto Story best-effort drafts**: When strict pacing cannot meet the requested runtime, reuse saved dialogue candidates to create a chronological, non-overlapping draft that remains editable and exportable; timing, source-gap, episode-span, and beat-length targets no longer block that draft.
+- **Auto Story render resilience and edit lists**: Keep a successfully assembled MP4 when caption generation or burning fails, and emit a machine-readable edit decision list alongside each story manifest.
 - **Auto Story restart recovery**: Resume analysis, planning, single story selection, reconstruction, failed story retries, and rendering from saved local checkpoints after backend restart; retain completed render outputs.
 - **In-progress recovery backups**: Download a portable source and analysis checkpoint during transcription, diarization, or discovery; defer backup during rendering to avoid partial output files.
 - **Auto Story pacing control**: Choose a validated 15–60 second minimum gap between source moments; preserve it through worker configuration and portable project export/import, with 30 seconds as the default.
@@ -44,6 +50,7 @@ All notable changes to the **OpenSource Clipping** project will be documented in
 - **Auto Story documentation and offline tests**: Document setup, Hugging Face model access, CLI options, caching, review flow, and v1 limitations. Regression tests mock transcription and diarization; tests do not call paid AI providers.
 
 ### Fixed
+- **Auto Story backup model settings**: Export the selected Faster-Whisper model from the actual job config and treat legacy null values as the default so saved projects can be restored.
 - **NVIDIA Auto Story model default**: Use `deepseek-ai/deepseek-v4.1-flash`, which is listed in NVIDIA's current hosted model catalog, instead of the unavailable `deepseek-ai/deepseek-v4-pro` identifier that returned HTTP 410.
 
 

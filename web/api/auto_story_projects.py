@@ -94,12 +94,22 @@ def export_project(job_id: str) -> tuple[Path, str]:
                 key: job.get("config", {}).get(key)
                 for key in (
                     "target_duration_sec", "min_gap_sec", "diarization_speakers",
-                    "ai_provider", "source_name", "whisper_model",
+                    "diarization_enabled", "workflow_mode",
+                    "ai_provider", "source_name",
                 )
             },
             "status": job.get("status"),
             "auto_story": job.get("auto_story") or {},
         }
+        project_data["config"]["whisper_model"] = (
+            job.get("config", {}).get("auto_story_whisper_model")
+            or job.get("config", {}).get("whisper_model")
+            or "small"
+        )
+        if type(project_data["config"].get("diarization_enabled")) is not bool:
+            project_data["config"]["diarization_enabled"] = True
+        if project_data["config"].get("workflow_mode") not in {"auto", "choose"}:
+            project_data["config"]["workflow_mode"] = "auto"
         with zipfile.ZipFile(archive_path, "w", allowZip64=True) as archive:
             archive.writestr("project.json", json.dumps(project_data, ensure_ascii=False, indent=2))
             archive.write(source, f"source/{_safe_filename(source.name)}", compress_type=zipfile.ZIP_STORED)
@@ -229,11 +239,13 @@ def _restore_archive(archive_path: Path) -> str:
         settings = manifest["config"]
         if (
             settings.get("ai_provider", "gemini") not in {"gemini", "nvidia"}
+            or settings.get("workflow_mode", "auto") not in {"auto", "choose"}
+            or type(settings.get("diarization_enabled", True)) is not bool
             or type(settings.get("target_duration_sec", 60)) is not int
             or not 60 <= settings.get("target_duration_sec", 60) <= 120
             or type(settings.get("min_gap_sec", 30)) is not int
             or not 15 <= settings.get("min_gap_sec", 30) <= 60
-            or settings.get("whisper_model", "small") not in {
+            or (settings.get("whisper_model") or "small") not in {
                 "tiny", "base", "small", "medium", "large-v3", "large-v3-turbo",
             }
             or (
@@ -389,14 +401,27 @@ def _restore_archive(archive_path: Path) -> str:
                 except RuntimeError as exc:
                     raise HTTPException(status_code=400, detail="Project speaker edits do not match the saved transcript.") from exc
 
+            # Archives written before workflow_mode existed used the multi-story
+            # selection screen whenever discovery returned multiple storylines.
+            # Preserve that intent on restore instead of silently treating the
+            # old project as a one-story Auto workflow.
+            workflow_mode = manifest["config"].get("workflow_mode")
+            if workflow_mode is None:
+                workflow_mode = (
+                    "choose"
+                    if len(imported_state.get("storylines", [])) > 1
+                    else "auto"
+                )
             config = {
                 "auto_story_mode": True,
+                "workflow_mode": workflow_mode,
                 "target_duration_sec": manifest["config"].get("target_duration_sec", 60),
                 "min_gap_sec": manifest["config"].get("min_gap_sec", 30),
                 "diarization_speakers": manifest["config"].get("diarization_speakers"),
+                "diarization_enabled": manifest["config"].get("diarization_enabled", True),
                 "ai_provider": manifest["config"].get("ai_provider", "gemini"),
                 "source_name": manifest["config"].get("source_name") or source_name,
-                "auto_story_whisper_model": manifest["config"].get("whisper_model", "small"),
+                "auto_story_whisper_model": manifest["config"].get("whisper_model") or "small",
                 "auto_story_whisper_device": "cpu",
                 "auto_story_whisper_compute_type": "int8",
             }

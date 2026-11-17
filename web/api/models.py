@@ -158,6 +158,9 @@ class AutoStoryCreateRequest(BaseModel):
 
     upload_filename: str = Field(..., description="Filename returned by /api/upload")
     source_name: str = Field("Episode", min_length=1, max_length=180)
+    workflow_mode: Literal["auto", "choose"] = Field(
+        "auto", description="Create the single best story automatically or choose storylines.",
+    )
     target_duration_sec: int = Field(60, ge=60, le=120)
     min_gap_sec: int = Field(
         30, ge=15, le=60,
@@ -169,6 +172,9 @@ class AutoStoryCreateRequest(BaseModel):
     diarization_speakers: int | None = Field(
         None, ge=1, le=16,
         description="Expected speaker count; omit or use null to let PyAnnote decide.",
+    )
+    diarization_enabled: bool = Field(
+        False, description="Run optional PyAnnote speaker diarization.",
     )
     story_count: Optional[int] = Field(
         None, ge=1, le=8, description="Legacy field; story count is discovered by AI."

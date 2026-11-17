@@ -54,7 +54,7 @@
 > 👉 **[Read the full Story Clip Documentation](docs/STORY_CLIP.md)**
 
 > 🎞️ **Auto Story-Recipe (`--auto-story-mode`)**
-> Discover the supported episode storylines, choose which to create, then let Auto Story build and render them.
+> Create one best dialogue story automatically by default, or switch to **Choose a Story** to select multiple storylines. Speaker diarization is optional; vertical video uses subject tracking when available.
 > 👉 **[Read the Auto Story-Recipe guide](docs/AUTO_STORY_RECIPE.md)**
 
 ## 📋 Prerequisites
@@ -64,7 +64,7 @@
 - **CUDA GPU** recommended (for Whisper; CPU fallback available)
 - **Google Gemini API Key** ([get one here](https://aistudio.google.com/apikey))
 - **Pexels API Key** (optional, for B-roll — [get one here](https://www.pexels.com/api/))
-- **HuggingFace Token** (optional for split-screen / camera-switch; required for Auto Story-Recipe diarization — [get one here](https://huggingface.co/settings/tokens), requires accepting [Pyannote model agreement](https://huggingface.co/pyannote/speaker-diarization-3.1))
+- **HuggingFace Token** (optional for split-screen / camera-switch; optional for Auto Story-Recipe speaker diarization — [get one here](https://huggingface.co/settings/tokens), requires accepting [Pyannote model agreement](https://huggingface.co/pyannote/speaker-diarization-3.1))
 
 ## ☁️ Running on Google Colab (Recommended)
 

@@ -179,6 +179,7 @@ def build_config_from_payload(
         split_trigger=payload.get("split_trigger", "diarization"),
         use_camera_switch=payload.get("use_camera_switch", False),
         diarization_num_speakers=payload.get("diarization_speakers") or "auto",
+        auto_story_diarization_enabled=payload.get("diarization_enabled", True),
         switch_hold_duration=payload.get("switch_hold_duration", 2.0),
         switch_blend_duration=payload.get("switch_blend_duration", 0.0),
         split_zoom=payload.get("split_zoom", 1.0),

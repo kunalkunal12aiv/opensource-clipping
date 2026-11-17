@@ -100,6 +100,7 @@ def _normalize_scene_segment(
     target_width: int = 1080,
     target_height: int = 1920,
     target_fps: int = 30,
+    crop_to_fill: bool = False,
 ) -> str:
     """
     Re-encode a scene segment to a consistent format so all segments can be
@@ -122,13 +123,20 @@ def _normalize_scene_segment(
     str
         Path to the normalized output file.
     """
-    # scale to fit, then pad to exact target size (center, black bars)
-    vf = (
-        f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
-        f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black,"
-        f"fps={target_fps},"
-        f"format=yuv420p"
-    )
+    if crop_to_fill:
+        vf = (
+            f"scale={target_width}:{target_height}:force_original_aspect_ratio=increase,"
+            f"crop={target_width}:{target_height}:(iw-ow)/2:(ih-oh)/2,"
+            f"fps={target_fps},format=yuv420p"
+        )
+    else:
+        # Preserve the existing fit-and-pad behavior for tracked scenes and
+        # layouts where the full source frame should remain visible.
+        vf = (
+            f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+            f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"fps={target_fps},format=yuv420p"
+        )
 
     cmd = [
         "ffmpeg", "-y",
@@ -493,6 +501,7 @@ def assemble_highlight(
     output_dir: str,
     ratio: str = "9:16",
     transition_duration: float = 0.5,
+    cfg=None,
 ) -> str | None:
     """
     Assemble the highlight segment for a single clip.
@@ -561,13 +570,72 @@ def assemble_highlight(
 
         duration = end - start
 
-        # Trim
-        trimmed = os.path.join(temp_dir, f"hl_{cid}_scene_{idx}_trim.mp4")
-        trim_scene(video_path, start, end, trimmed, reencode=True)
+        # Reuse the standard clipping face tracker for vertical Auto Story
+        # scenes. Wide ratios retain the standard fit-to-frame behavior.
+        use_subject_tracking = bool(
+            cfg is not None
+            and ratio in {"9:16", "1:1", "3:4", "4:5"}
+            and not getattr(cfg, "static_crop", False)
+        )
+        center_crop_fallback = ratio in {"9:16", "1:1", "3:4", "4:5"}
+        if use_subject_tracking:
+            try:
+                from clipping import studio
+
+                tracked_silent = os.path.join(
+                    temp_dir, f"hl_{cid}_scene_{idx}_tracked_silent.mp4"
+                )
+                tracked_with_audio = os.path.join(
+                    temp_dir, f"hl_{cid}_scene_{idx}_tracked.mp4"
+                )
+                studio.buat_video_hybrid(
+                    video_path,
+                    tracked_silent,
+                    start,
+                    end,
+                    ratio,
+                    cfg,
+                    label=f"Auto Story scene {idx + 1}",
+                )
+                if not os.path.isfile(tracked_silent) or os.path.getsize(tracked_silent) == 0:
+                    raise RuntimeError("Subject tracker did not produce a video scene.")
+                _run_ffmpeg(
+                    [
+                        "ffmpeg", "-y", "-i", tracked_silent,
+                        "-ss", f"{start:.3f}", "-i", video_path,
+                        "-t", f"{duration:.3f}",
+                        "-map", "0:v:0", "-map", "1:a:0?",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+                        "-shortest", tracked_with_audio,
+                    ],
+                    label=f"mux tracked Auto Story scene {idx + 1} audio",
+                )
+                if not os.path.isfile(tracked_with_audio) or os.path.getsize(tracked_with_audio) == 0:
+                    raise RuntimeError("Tracked Auto Story scene did not preserve source audio.")
+                trimmed = tracked_with_audio
+                center_crop_fallback = False
+            except Exception as exc:
+                print(
+                    f"      Subject tracking failed for scene {idx + 1}; "
+                    f"using center framing: {type(exc).__name__}: {exc}"
+                )
+                trimmed = os.path.join(temp_dir, f"hl_{cid}_scene_{idx}_trim.mp4")
+                trim_scene(video_path, start, end, trimmed, reencode=True)
+        else:
+            # Center-framed fallback for landscape output and explicit static crop.
+            trimmed = os.path.join(temp_dir, f"hl_{cid}_scene_{idx}_trim.mp4")
+            trim_scene(video_path, start, end, trimmed, reencode=True)
 
         # Normalize
         normed = os.path.join(temp_dir, f"hl_{cid}_scene_{idx}_norm.mp4")
-        _normalize_scene_segment(trimmed, normed, target_w, target_h)
+        _normalize_scene_segment(
+            trimmed,
+            normed,
+            target_w,
+            target_h,
+            crop_to_fill=center_crop_fallback,
+        )
         normalized_parts.append(normed)
         scene_durations.append(duration)
 

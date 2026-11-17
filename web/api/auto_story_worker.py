@@ -35,10 +35,12 @@ def _build_config(job: dict):
     payload = {
         "source": "local",
         "upload_filename": job.get("upload_filename"),
+        "workflow_mode": settings.get("workflow_mode", "auto"),
         "ai_provider": settings.get("ai_provider", "gemini"),
         "target_duration_sec": settings.get("target_duration_sec", 60),
         "min_gap_sec": settings.get("min_gap_sec", 30),
         "diarization_speakers": settings.get("diarization_speakers") or "auto",
+        "diarization_enabled": settings.get("diarization_enabled", True),
         "auto_story_mode": True,
         "auto_story_whisper_model": settings.get("auto_story_whisper_model", "small"),
         "auto_story_whisper_device": settings.get("auto_story_whisper_device", "cpu"),
@@ -395,6 +397,8 @@ def _discover_sync(job_id: str) -> dict:
         source_signature=context["source_signature"],
         source_file_stat=context["source_file_stat"],
         phase="episode_preparation",
+        selected_storyline_ids=[],
+        selected_story_count=0,
         message=(
             "Episode bytes changed. Rebuilding transcript and speaker analysis for this source."
             if source_changed
@@ -411,7 +415,11 @@ def _discover_sync(job_id: str) -> dict:
         JobStatus.TRANSCRIBING,
         "transcribe",
         1,
-        "Transcribing the episode and identifying speakers. This can take a while.",
+        (
+            "Transcribing the episode and identifying speakers. This can take a while."
+            if cfg.auto_story_diarization_enabled
+            else "Transcribing the episode. Speaker identification is turned off."
+        ),
         10,
     )
     _update_state(
@@ -491,7 +499,11 @@ def _discover_sync(job_id: str) -> dict:
         }),
         analysis_ready=True,
         phase="storyline_discovery",
-        message="Transcript and speaker labels are saved. Finding storylines.",
+        message=(
+            "Transcript and speaker labels are saved. Finding storylines."
+            if cfg.auto_story_diarization_enabled
+            else "Transcript is saved. Finding a story from the dialogue."
+        ),
     )
 
     state = get_state(job_id)
@@ -512,7 +524,7 @@ def _discover_sync(job_id: str) -> dict:
         context["auto_cache_dir"],
         context["output_dir"],
         cfg,
-        count=None,
+        count=1 if job.get("config", {}).get("workflow_mode", "auto") == "auto" else None,
         target_duration_sec=cfg.auto_story_target_duration,
         min_gap_sec=cfg.auto_story_min_gap_sec,
         cache_variant=f"discovery-{discovery_revision}",
@@ -627,10 +639,89 @@ def _create_story_plan(
             }
         except ValueError as exc:
             last_error = exc
+
+    # A candidate pool can be useful even when it cannot satisfy the strict
+    # automatic pacing target. Reuse the last saved pool for an exportable draft;
+    # this fallback never spends another provider call or invents dialogue.
+    fallback_round = len(schedules) - 1
+    min_gap, min_span_ratio = schedules[fallback_round]
+    settings = {
+        "target_duration_sec": cfg.auto_story_target_duration,
+        "min_beat_sec": cfg.auto_story_min_beat_sec,
+        "max_beat_sec": cfg.auto_story_max_beat_sec,
+        "min_gap_sec": min_gap,
+        "min_episode_span_ratio": min_span_ratio,
+        "padding_sec": cfg.auto_story_padding_sec,
+        "crossfade_sec": crossfade_sec,
+        "best_effort": True,
+    }
+    try:
+        response, cache_key = pipeline._select_beats(
+            arc,
+            words,
+            cfg.auto_story_target_duration,
+            cfg.auto_story_min_beat_sec,
+            cfg.auto_story_max_beat_sec,
+            min_gap,
+            min_span_ratio,
+            state["source_duration_sec"],
+            cfg.auto_story_padding_sec,
+            crossfade_sec,
+            state["transcript_key"],
+            context["auto_cache_dir"],
+            cfg,
+            candidate_round=fallback_round,
+            planning_revision=planning_revision,
+            speaker_names=_speaker_names_for_state(state),
+            speaker_corrections_key=_speaker_corrections_key(state),
+            best_effort=True,
+            cache_only=True,
+        )
+        recipe_path = os.path.join(
+            context["output_dir"], f"{story_id}_recipe_{cache_key[:12]}.json"
+        )
+        recipe = pipeline._build_review_recipe(
+            response, arc, words, state["source_id"], settings
+        )
+        validated = pipeline.validate_review_recipe(
+            recipe,
+            arc,
+            words,
+            state["source_id"],
+            state["source_duration_sec"],
+            settings["target_duration_sec"],
+            settings["min_beat_sec"],
+            settings["max_beat_sec"],
+            settings["min_gap_sec"],
+            settings["min_episode_span_ratio"],
+            settings["padding_sec"],
+            settings["crossfade_sec"],
+        )
+        recipe = _normalize_review_recipe(recipe, validated)
+        pipeline._write_json(recipe_path, recipe)
+        return {
+            "story_id": story_id,
+            "storyline": arc,
+            "recipe": recipe,
+            "settings": settings,
+            "timing_options": pipeline._build_review_timing_options(
+                recipe, arc, words
+            ),
+            "recipe_filename": os.path.basename(recipe_path),
+            "validation": {
+                "beat_count": len(validated["beats"]),
+                "estimated_runtime_sec": validated["estimated_runtime_sec"],
+                "episode_span_sec": validated["episode_span_sec"],
+                "best_effort": True,
+            },
+        }
+    except ValueError as fallback_error:
+        fallback_message = str(fallback_error)
     raise ValueError(
-        f"Could not schedule story {arc['title']!r} after three candidate "
-        f"attempts, including a {schedules[-1][0]:.1f}-second pacing fallback: "
-        f"{last_error}"
+        f"Could not create a strict schedule or a best-effort draft for "
+        f"story {arc['title']!r}. The last strict attempt required a "
+        f"{schedules[-1][0]:.1f}-second source gap: {last_error} "
+        f"Best-effort fallback: {fallback_message}"
     ) from last_error
 
 
@@ -1115,6 +1206,10 @@ def _render_story_sync(
         cfg,
         output_prefix=output_prefix,
     )
+    edl_path = os.path.join(
+        context["output_dir"], f"{output_prefix}_edit_decision_list.json"
+    )
+    pipeline._write_json(edl_path, pipeline._build_edit_decision_list(validated))
     manifest_path = os.path.join(
         context["output_dir"], f"{output_prefix}_manifest.json"
     )
@@ -1129,17 +1224,20 @@ def _render_story_sync(
         "actual_runtime_sec": actual_runtime,
         "settings": validated["settings"],
         "video_file": os.path.basename(video_path),
-        "captions_file": os.path.basename(captions_path),
+        "captions_file": os.path.basename(captions_path) if captions_path else None,
+        "edit_decision_list_file": os.path.basename(edl_path),
         "recipe_file": story["recipe_filename"],
         "beats": validated["beats"],
     }
     pipeline._write_json(manifest_path, manifest)
-    filenames = [
-        os.path.basename(video_path),
-        os.path.basename(captions_path),
+    filenames = [os.path.basename(video_path)]
+    if captions_path:
+        filenames.append(os.path.basename(captions_path))
+    filenames.extend([
+        os.path.basename(edl_path),
         os.path.basename(manifest_path),
         story["recipe_filename"],
-    ]
+    ])
     files = [
         {
             "filename": filename,
@@ -1582,6 +1680,44 @@ async def _run_stage(job_id: str, stage: str, function, *args) -> None:
         _check_cancelled(job_id)
         if stage == "discovery":
             count = len(result.get("storylines", []))
+            job = _job(job_id)
+            auto_mode = job.get("config", {}).get("workflow_mode", "auto") == "auto"
+            if auto_mode and count:
+                best_storyline = result["storylines"][0]
+                state = _update_state(
+                    job_id,
+                    **result,
+                    phase="story_planning",
+                    message=(
+                        f"Found the strongest supported storyline, {best_storyline['title']}. "
+                        "Building one story from its dialogue."
+                    ),
+                )
+                store.update_job(
+                    job_id,
+                    status=JobStatus.ANALYZING.value,
+                    auto_story=state,
+                )
+                store.update_progress(
+                    job_id,
+                    "story_planning",
+                    3,
+                    _TOTAL_STEPS,
+                    state["message"],
+                    70,
+                )
+                current_task = asyncio.current_task()
+                if current_task is not None:
+                    current_task.add_done_callback(
+                        lambda _done: _start(
+                            job_id,
+                            "generation",
+                            _create_selected_stories_sync,
+                            [best_storyline["id"]],
+                            False,
+                        )
+                    )
+                return
             state = _update_state(
                 job_id,
                 **result,

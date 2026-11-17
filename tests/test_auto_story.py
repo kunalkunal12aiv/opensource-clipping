@@ -198,6 +198,54 @@ def test_transcript_and_diarization_are_cached_separately(monkeypatch, tmp_path)
     }
 
 
+def test_dialogue_only_transcription_skips_diarization_without_hf_token(
+    monkeypatch, tmp_path
+):
+    from clipping import diarization, engine
+
+    video_path = tmp_path / "dialogue_only.mp4"
+    video_path.write_bytes(b"synthetic media")
+    calls = {"transcribe": 0, "diarize": 0}
+
+    def fake_transcribe(*_args, **_kwargs):
+        calls["transcribe"] += 1
+        return "hello", [{
+            "words": [{"word": "Hello.", "start": 0.1, "end": 0.8}],
+        }]
+
+    def forbidden_diarization(*_args, **_kwargs):
+        calls["diarize"] += 1
+        pytest.fail("diarization is disabled for this project")
+
+    monkeypatch.setattr(engine, "transcribe_video", fake_transcribe)
+    monkeypatch.setattr(diarization, "extract_audio", forbidden_diarization)
+    monkeypatch.setattr(diarization, "run_diarization", forbidden_diarization)
+    cfg = SimpleNamespace(
+        auto_story_whisper_model="small",
+        auto_story_whisper_device="cpu",
+        auto_story_whisper_compute_type="int8",
+        auto_story_diarization_enabled=False,
+        max_kata_per_subtitle=5,
+        hf_token="",
+        diarization_num_speakers="auto",
+    )
+    cache_events = []
+
+    words, _key = auto_story._load_or_create_transcript(
+        str(video_path),
+        "episode",
+        str(tmp_path / "cache"),
+        cfg,
+        2.0,
+        cache_callback=cache_events.append,
+    )
+
+    assert words[0]["word"] == "Hello."
+    assert words[0]["speaker_id"] is None
+    assert calls == {"transcribe": 1, "diarize": 0}
+    assert cache_events[-1]["diarization"] == "disabled"
+
+
 def test_file_signature_is_stable_across_identical_upload_paths(tmp_path):
     first = tmp_path / "first.mp4"
     second = tmp_path / "second.mp4"
@@ -380,6 +428,330 @@ def test_recipe_validation_enforces_span_gaps_and_runtime():
             crossfade_sec=0.06,
         )
 
+
+def test_best_effort_recipe_keeps_short_exportable_story_when_target_is_unreachable():
+    words, arc, beats = _episode_words()
+    candidate_pool = {"beats": beats[:2]}
+    with pytest.raises(ValueError, match="do not span enough"):
+        auto_story._schedule_beat_candidates(
+            candidate_pool, arc, words, 3600, 60, 3.5, 6.0, 30, 0.4,
+            0.18, 0.06,
+        )
+
+    scheduled = auto_story._schedule_beat_candidates(
+        candidate_pool, arc, words, 3600, 60, 3.5, 6.0, 30, 0.4,
+        0.18, 0.06, best_effort=True,
+    )
+    recipe = auto_story._build_review_recipe(
+        scheduled,
+        arc,
+        words,
+        "episode",
+        {"target_duration_sec": 60, "best_effort": True},
+    )
+    result = auto_story.validate_review_recipe(
+        recipe,
+        arc,
+        words,
+        "episode",
+        episode_duration=3600,
+        target_duration=60,
+        min_beat_sec=3.5,
+        max_beat_sec=6.0,
+        min_gap_sec=30,
+        min_episode_span_ratio=0.4,
+        padding_sec=0.18,
+        crossfade_sec=0.06,
+    )
+
+    assert len(result["beats"]) == 2
+    assert result["estimated_runtime_sec"] < 60
+    assert result["settings"]["best_effort"] is True
+    assert result["episode_span_sec"] < 3600 * 0.4
+
+
+def test_candidate_scheduler_deduplicates_points_and_prefers_strong_payoff():
+    words, arc, base_beats = _episode_words()
+    candidates = []
+    for index, base in enumerate(base_beats[:4]):
+        candidate = dict(base)
+        candidate["narrative_role"] = (
+            "hook" if index == 0 else "twist/payoff" if index == 3 else "escalation"
+        )
+        candidate.update({
+            "context_score": 4,
+            "sequence_score": 5,
+            "payoff_strength": 2 if index == 3 else 1,
+            "redundancy_key": "same reveal" if index in (1, 2) else f"claim {index}",
+        })
+        candidates.append(candidate)
+    # The second version of this narrative point is clearer and should survive.
+    candidates[2]["context_score"] = 5
+    candidates[2]["payoff_strength"] = 4
+    candidates[3]["payoff_strength"] = 5
+
+    scheduled = auto_story._schedule_beat_candidates(
+        {"beats": candidates}, arc, words, 3600, 60, 3.5, 6.0, 30, .4,
+        .18, .06, best_effort=True,
+    )
+
+    chosen = scheduled["beats"]
+    assert len({beat["redundancy_key"] for beat in chosen}) == len(chosen)
+    assert chosen[-1]["narrative_role"] == "twist/payoff"
+    assert chosen[-1]["payoff_strength"] == 5
+    assert candidates[2] in chosen
+    assert candidates[1] not in chosen
+
+
+def test_best_effort_cache_only_mode_never_calls_provider_for_missing_pool(
+    monkeypatch, tmp_path
+):
+    words, arc, _ = _episode_words()
+    monkeypatch.setattr(auto_story, "_provider_model", lambda _cfg: ("test", "model"))
+    monkeypatch.setattr(auto_story, "_read_cache", lambda *_args: None)
+
+    def unexpected_provider_call(*_args, **_kwargs):
+        raise AssertionError("cache-only planning must not call a provider")
+
+    monkeypatch.setattr(auto_story, "_request_json", unexpected_provider_call)
+    with pytest.raises(ValueError, match="No saved dialogue candidate pool"):
+        auto_story._select_beats(
+            arc, words, 60, 3.5, 6.0, 15, 0.2, 3600, 0.18, 0.06,
+            "transcript-key", str(tmp_path), SimpleNamespace(),
+            candidate_round=2, best_effort=True, cache_only=True,
+        )
+
+
+def test_best_effort_render_accepts_actual_runtime_outside_target(
+    monkeypatch, tmp_path
+):
+    from clipping import studio
+
+    words, arc, beats = _episode_words()
+    scheduled = auto_story._schedule_beat_candidates(
+        {"beats": beats[:2]}, arc, words, 3600, 60, 3.5, 6.0, 30, 0.4,
+        0.18, 0.06, best_effort=True,
+    )
+    recipe = auto_story._build_review_recipe(
+        scheduled,
+        arc,
+        words,
+        "episode",
+        {"target_duration_sec": 60, "best_effort": True, "crossfade_sec": 0.06},
+    )
+    validated = auto_story.validate_review_recipe(
+        recipe, arc, words, "episode", 3600, 60, 3.5, 6.0, 30, 0.4, 0.18, 0.06
+    )
+    monkeypatch.setattr(studio, "buat_file_ass", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auto_story, "_probe_duration", lambda _path: 10.7)
+
+    def fake_assemble(*, output_dir, **_kwargs):
+        raw_path = Path(output_dir) / "highlight_1.mp4"
+        raw_path.write_bytes(b"synthetic montage")
+        return str(raw_path)
+
+    monkeypatch.setattr(assembler, "assemble_highlight", fake_assemble)
+    cfg = SimpleNamespace(
+        max_kata_per_subtitle=5,
+        pilihan_rasio="16:9",
+        no_subs=True,
+    )
+    output_path, _captions_path, runtime = auto_story._render_montage(
+        validated,
+        words,
+        {},
+        str(tmp_path / "cache"),
+        str(tmp_path / "outputs"),
+        cfg,
+    )
+
+    assert Path(output_path).is_file()
+    assert runtime == 10.7
+
+
+def test_caption_generation_failure_keeps_rendered_video(monkeypatch, tmp_path):
+    from clipping import studio
+
+    words, arc, beats = _episode_words()
+    response = {"beats": [beats[0]]}
+    recipe = auto_story._build_review_recipe(
+        response, arc, words, "episode",
+        {"target_duration_sec": 60, "best_effort": True},
+    )
+    validated = auto_story.validate_review_recipe(
+        recipe, arc, words, "episode", 3600, 60, 3.5, 6, 30, 0.4, 0.18, 0.06
+    )
+    monkeypatch.setattr(
+        studio, "buat_file_ass", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("synthetic caption failure")
+        ),
+    )
+
+    def fake_assemble(*, output_dir, **_kwargs):
+        raw_path = Path(output_dir) / "highlight_1.mp4"
+        raw_path.write_bytes(b"synthetic video with audio")
+        return str(raw_path)
+
+    monkeypatch.setattr(assembler, "assemble_highlight", fake_assemble)
+    monkeypatch.setattr(auto_story, "_probe_duration", lambda _path: 5.2)
+    cfg = SimpleNamespace(
+        max_kata_per_subtitle=5,
+        pilihan_rasio="16:9",
+        no_subs=False,
+        font_dir=str(tmp_path),
+    )
+
+    output_path, captions_path, runtime = auto_story._render_montage(
+        validated, words, {}, str(tmp_path / "cache"), str(tmp_path), cfg
+    )
+
+    assert Path(output_path).is_file()
+    assert captions_path is None
+    assert runtime == 5.2
+
+
+def test_edit_decision_list_tracks_source_and_timeline_intervals():
+    words, arc, beats = _episode_words()
+    scheduled = auto_story._schedule_beat_candidates(
+        {"beats": beats[:2]}, arc, words, 3600, 60, 3.5, 6, 30, .4, .18, .06,
+        best_effort=True,
+    )
+    recipe = auto_story._build_review_recipe(
+        scheduled, arc, words, "episode", {"target_duration_sec": 60, "best_effort": True}
+    )
+    validated = auto_story.validate_review_recipe(
+        recipe, arc, words, "episode", 3600, 60, 3.5, 6, 30, .4, .18, .06
+    )
+
+    edl = auto_story._build_edit_decision_list(validated)
+
+    assert len(edl["clips"]) == 2
+    assert edl["clips"][0]["source_id"] == "episode"
+    assert edl["clips"][0]["timeline_start_sec"] == 0
+    assert edl["clips"][1]["timeline_start_sec"] == pytest.approx(
+        edl["clips"][0]["timeline_end_sec"] - .06
+    )
+    assert edl["estimated_runtime_sec"] == pytest.approx(
+        validated["estimated_runtime_sec"]
+    )
+
+
+def test_vertical_highlight_uses_standard_subject_tracker(monkeypatch, tmp_path):
+    from clipping import studio
+
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    calls = []
+
+    def fake_tracker(input_video, output_video, start, end, ratio, _cfg, **_kwargs):
+        calls.append((input_video, start, end, ratio))
+        Path(output_video).write_bytes(b"tracked silent video")
+
+    monkeypatch.setattr(studio, "buat_video_hybrid", fake_tracker)
+    monkeypatch.setattr(
+        assembler, "_run_ffmpeg",
+        lambda cmd, **_kwargs: Path(cmd[-1]).write_bytes(b"tracked with audio"),
+    )
+    normalize_options = []
+
+    def fake_normalize(_source, output, *_args, **kwargs):
+        normalize_options.append(kwargs)
+        Path(output).write_bytes(b"normalized")
+
+    monkeypatch.setattr(assembler, "_normalize_scene_segment", fake_normalize)
+    monkeypatch.setattr(
+        assembler, "concat_scenes",
+        lambda _parts, output, **_kwargs: Path(output).write_bytes(b"montage"),
+    )
+    output = assembler.assemble_highlight(
+        {"clip_id": 1, "highlight": {"scenes": [{
+            "source_id": "episode", "start": 2.0, "end": 4.0, "label": "dialogue",
+        }]}},
+        {"episode": {"platform": "local", "local_path": str(source)}},
+        str(tmp_path / "cache"),
+        str(tmp_path / "rendered"),
+        ratio="9:16",
+        cfg=SimpleNamespace(static_crop=False),
+    )
+
+    assert calls == [(str(source), 2.0, 4.0, "9:16")]
+    assert normalize_options == [{"crop_to_fill": False}]
+    assert Path(output).is_file()
+
+
+def test_vertical_highlight_tracker_failure_uses_center_crop(monkeypatch, tmp_path):
+    from clipping import studio
+
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    normalize_options = []
+
+    def fail_tracker(*_args, **_kwargs):
+        raise RuntimeError("synthetic detector failure")
+
+    monkeypatch.setattr(studio, "buat_video_hybrid", fail_tracker)
+    monkeypatch.setattr(
+        assembler,
+        "trim_scene",
+        lambda _source, _start, _end, output, **_kwargs: Path(output).write_bytes(b"trim"),
+    )
+
+    def fake_normalize(_source, output, *_args, **kwargs):
+        normalize_options.append(kwargs)
+        Path(output).write_bytes(b"normalized")
+
+    monkeypatch.setattr(assembler, "_normalize_scene_segment", fake_normalize)
+    monkeypatch.setattr(
+        assembler,
+        "concat_scenes",
+        lambda _parts, output, **_kwargs: Path(output).write_bytes(b"montage"),
+    )
+    output = assembler.assemble_highlight(
+        {"clip_id": 1, "highlight": {"scenes": [{
+            "source_id": "episode", "start": 2.0, "end": 4.0,
+        }]}},
+        {"episode": {"platform": "local", "local_path": str(source)}},
+        str(tmp_path / "cache"),
+        str(tmp_path / "rendered"),
+        ratio="9:16",
+        cfg=SimpleNamespace(static_crop=False),
+    )
+
+    assert Path(output).is_file()
+    assert normalize_options == [{"crop_to_fill": True}]
+
+
+def test_center_crop_normalization_fills_portrait_frame(tmp_path):
+    import subprocess
+
+    source = tmp_path / "wide_red.mp4"
+    normalized = tmp_path / "portrait_red.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi", "-i",
+            "color=c=red:s=640x360:d=0.5:r=30", "-an", "-c:v", "libx264",
+            "-pix_fmt", "yuv420p", str(source),
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assembler._normalize_scene_segment(
+        str(source), str(normalized), 108, 192, target_fps=30, crop_to_fill=True
+    )
+    frame = subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-i", str(normalized), "-frames:v", "1",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ).stdout
+
+    assert len(frame) == 108 * 192 * 3
+    assert frame[:3][0] > 150
+    assert frame[-3] > 150
 
 def test_review_timing_options_use_cached_word_boundaries_and_respect_duration():
     words, arc, beats = _episode_words()
