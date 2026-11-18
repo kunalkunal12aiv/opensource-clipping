@@ -37,8 +37,11 @@ JSON, and explicitly approving the single montage.
   Accept the model's terms on Hugging Face. Story discovery and planning work
   without diarization; speaker labels are optional context.
 - The key for the explicitly selected AI provider: `GOOGLE_API_KEY` for
-  Gemini, or `NVIDIA_API_KEY` for NVIDIA. NVIDIA uses
-  `deepseek-ai/deepseek-v4.1-flash` by default.
+  Gemini, `NVIDIA_API_KEY` for NVIDIA, or `FREELLMAPI_API_KEY` for FreeLLMAPI.
+  FreeLLMAPI uses its OpenAI-compatible chat endpoint and `auto` model routing;
+  configure `FREELLMAPI_BASE_URL` to a URL reachable from the backend (defaults
+  to `http://127.0.0.1:3001/v1`). NVIDIA uses `deepseek-ai/deepseek-v4-pro` by
+  default.
 - A local video or a source supported by the existing Story Clip downloader.
 
 Put the selected provider key in the git-ignored `.env` file in the project
@@ -146,9 +149,12 @@ disk. If the backend process restarts mid-stage, the job is marked failed and
 use **Retry from saved transcript and speakers** to retry story discovery from
 the saved analysis when the source/cache remain available. Failures while the
 job is waiting for story selection can use **Rerun story discovery** directly.
-Transient AI provider errors receive bounded automatic retries, and the
-discovery pass requests one corrected response when returned story ranges fail
-transcript validation.
+Transient AI provider errors receive bounded automatic retries that honor the
+provider's retry delay. If discovery still fails, choose another configured AI
+provider and retry from the saved transcript; diarization and transcription do
+not need to run again. Discovery also requests one corrected response when
+returned story ranges fail transcript validation. A provider error is shown as
+a retryable failure, not as a successful discovery with zero storylines.
 The dashboard also checks whether the local job index is saving. If it reports
 storage trouble, download portable backups for projects you need to keep. An
 unreadable existing `jobs.json` is protected from automatic replacement; recover
@@ -191,9 +197,9 @@ episode and generated files.
 The Kaggle notebook runs the API, while the local React dashboard provides the
 Auto Story page. Start the Kaggle backend using the
 [Kaggle Studio guide](./KAGGLE_STUDIO.md), with Internet and a GPU enabled.
-Provide `NGROK_AUTHTOKEN`, `HF_TOKEN`, and the selected AI provider key through
-Kaggle Secrets. Keep the notebook server cell running and copy its HTTPS Public
-URL.
+Provide `NGROK_AUTHTOKEN` and the selected AI provider key through Kaggle
+Secrets. Add `HF_TOKEN` only if you enable speaker diarization. Keep the
+notebook server cell running and copy its HTTPS Public URL.
 
 On Windows, start only the dashboard locally; do not start a local API server.
 In a PowerShell terminal at the repository root, set the tunnel URL as Vite's

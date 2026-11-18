@@ -8,6 +8,7 @@ import enum
 import re
 from datetime import datetime
 from typing import Any, Literal, Optional
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -60,6 +61,7 @@ class FaceDetector(str, enum.Enum):
 class AIProvider(str, enum.Enum):
     GEMINI = "gemini"
     NVIDIA = "nvidia"
+    FREELLMAPI = "freellmapi"
 
 
 class WhisperDevice(str, enum.Enum):
@@ -202,6 +204,12 @@ class AutoStorySelectionRequest(BaseModel):
         if len(set(self.storyline_ids)) != len(self.storyline_ids):
             raise ValueError("Selected storylines must be unique.")
         return self
+
+
+class AutoStoryRediscoveryRequest(BaseModel):
+    """Optionally switch providers while retrying discovery from saved analysis."""
+
+    ai_provider: AIProvider | None = None
 
 
 class AutoStorySpeakerNamesRequest(BaseModel):
@@ -357,6 +365,8 @@ class SettingsRequest(BaseModel):
     pexels_api_key: Optional[str] = None
     hf_token: Optional[str] = None
     nvidia_api_key: Optional[str] = None
+    freellmapi_api_key: Optional[str] = None
+    freellmapi_base_url: Optional[str] = Field(None, max_length=500)
     # Defaults
     default_clips: Optional[int] = None
     default_ratio: Optional[AspectRatio] = None
@@ -365,6 +375,24 @@ class SettingsRequest(BaseModel):
     default_whisper_device: Optional[WhisperDevice] = None
     default_ai_provider: Optional[AIProvider] = None
 
+    @field_validator("freellmapi_base_url")
+    @classmethod
+    def validate_freellmapi_base_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        value = value.strip().rstrip("/")
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("FreeLLMAPI URL must be an http(s) base URL without credentials, query, or fragment.")
+        return value
+
 
 class SettingsResponse(BaseModel):
     """Current settings (keys are masked)."""
@@ -372,6 +400,8 @@ class SettingsResponse(BaseModel):
     pexels_api_key_set: bool = False
     hf_token_set: bool = False
     nvidia_api_key_set: bool = False
+    freellmapi_api_key_set: bool = False
+    freellmapi_base_url: str = "http://127.0.0.1:3001/v1"
     default_clips: int = 7
     default_ratio: str = "9:16"
     default_font_style: str = "HORMOZI"

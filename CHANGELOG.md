@@ -10,6 +10,7 @@ All notable changes to the **OpenSource Clipping** project will be documented in
 ## [Unreleased]
 
 ### Added
+- **Auto Story provider recovery**: Retry failed storyline discovery with either configured provider while reusing saved transcript/speaker caches; distinguish provider request failures from successful empty discovery, surface NVIDIA HTTP details, honor retry delays, and use one documented NVIDIA model default across CLI and dashboard.
 - **Auto Story default workflow and quality ranking**: Make one best-story workflow the default while retaining Choose a Story multi-story mode; ask the provider to rank context-complete, connected, non-redundant dialogue and stronger payoffs, then use those scores in scheduling.
 - **Optional speaker diarization**: Allow transcript-first story creation without PyAnnote or an HF token; enable diarization when users need speaker labels and preserve the choice in project backups.
 - **Legacy Auto Story restore**: Infer Choose a Story mode for older project backups that contain multiple discovered storylines but no saved workflow setting, preserving the original multi-story intent.

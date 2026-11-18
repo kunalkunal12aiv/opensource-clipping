@@ -80,6 +80,51 @@ def test_auto_story_does_not_require_huggingface_for_dialogue_only_mode(api, mon
     assert store.get_job(response.json()["id"])["config"]["diarization_enabled"] is False
 
 
+def test_auto_story_accepts_freellmapi_unified_key(api, monkeypatch):
+    client, _ = api
+    submitted = []
+    monkeypatch.setattr(worker, "_settings_env", {"FREELLMAPI_API_KEY": "unified-key"})
+    monkeypatch.setattr(auto_story_routes, "cuda_available", lambda: False)
+
+    async def fake_submit(job_id):
+        submitted.append(job_id)
+
+    monkeypatch.setattr(auto_story_worker, "submit_discovery", fake_submit)
+    response = client.post(
+        "/api/auto-story",
+        json={
+            "upload_filename": "uploaded_episode.mp4",
+            "ai_provider": "freellmapi",
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert store.get_job(response.json()["id"])["config"]["ai_provider"] == "freellmapi"
+    assert submitted == [response.json()["id"]]
+
+
+def test_settings_store_freellmapi_key_and_gateway_url(api, monkeypatch):
+    client, tmp_path = api
+    monkeypatch.setattr(settings_routes, "cuda_available", lambda: False)
+    monkeypatch.setattr(settings_routes, "_check_ffmpeg", lambda: True)
+
+    response = client.put(
+        "/api/settings",
+        json={
+            "freellmapi_api_key": "a-secret-unified-key",
+            "freellmapi_base_url": "https://gateway.example/v1",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["freellmapi_api_key_set"] is True
+    assert response.json()["freellmapi_base_url"] == "https://gateway.example/v1"
+    assert "a-secret-unified-key" not in response.text
+    env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "FREELLMAPI_API_KEY=" in env_text
+    assert "a-secret-unified-key" in env_text
+
+
 def test_auto_story_create_uploads_job_and_queues_discovery(api, monkeypatch):
     client, _ = api
     submitted = []
@@ -1089,6 +1134,46 @@ def test_failed_discovery_can_retry_without_recreating_the_job(api, monkeypatch)
     assert submitted == [job_id]
     assert response.json()["status"] == JobStatus.ANALYZING.value
     assert response.json()["auto_story"]["discovery_revision"] == 3
+
+
+def test_story_discovery_retry_can_switch_provider_and_keep_analysis(api, monkeypatch):
+    client, _ = api
+    job_id = store.create_job(
+        upload_filename="uploaded_episode.mp4",
+        source="local",
+        config={"auto_story_mode": True, "ai_provider": "nvidia"},
+    )
+    store.update_job(
+        job_id,
+        status=JobStatus.AWAITING_STORYLINE.value,
+        auto_story={
+            "phase": "awaiting_storyline",
+            "analysis_ready": True,
+            "transcript_key": "saved-transcript",
+            "speaker_ids": ["SPEAKER_00"],
+            "last_failed_stage": "storyline_discovery",
+        },
+    )
+    submitted = []
+    monkeypatch.setattr(auto_story_routes, "_required_key", lambda _key: True)
+
+    async def fake_rediscover(submitted_job_id):
+        submitted.append(submitted_job_id)
+
+    monkeypatch.setattr(auto_story_worker, "submit_rediscovery", fake_rediscover)
+    response = client.post(
+        f"/api/auto-story/{job_id}/storylines/rediscover",
+        json={"ai_provider": "gemini"},
+    )
+
+    assert response.status_code == 200, response.text
+    saved = store.get_job(job_id)
+    assert saved["config"]["ai_provider"] == "gemini"
+    assert saved["auto_story"]["analysis_ready"] is True
+    assert saved["auto_story"]["transcript_key"] == "saved-transcript"
+    assert saved["auto_story"]["speaker_ids"] == ["SPEAKER_00"]
+    assert "saved transcript and speaker analysis will be reused" in saved["auto_story"]["message"]
+    assert submitted == [job_id]
 
 
 def test_completed_project_can_reopen_manual_review_when_cache_is_present(api):

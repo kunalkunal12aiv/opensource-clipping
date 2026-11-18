@@ -10,12 +10,13 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable
+from urllib.parse import urlsplit
 
 PROMPT_VERSION = "auto-story-recipe-v2-multi-story-planning"
 BEAT_PROMPT_VERSION = "auto-story-beats-v3-retry-candidates"
 DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
 AI_TIMEOUT_SECONDS = 900
-AI_REQUEST_MAX_ATTEMPTS = 3
+AI_REQUEST_MAX_ATTEMPTS = 4
 WORD_BOUNDARY_TOLERANCE = 0.05
 
 
@@ -439,6 +440,13 @@ def _provider_model(cfg) -> tuple[str, str]:
                 "Auto Story requires NVIDIA_API_KEY when --ai-provider nvidia is selected."
             )
         return cfg.ai_provider, cfg.nvidia_model
+    if cfg.ai_provider == "freellmapi":
+        if not getattr(cfg, "api_key_freellmapi", ""):
+            raise RuntimeError(
+                "Auto Story requires FREELLMAPI_API_KEY when FreeLLMAPI is selected."
+            )
+        _freellmapi_chat_url(getattr(cfg, "freellmapi_base_url", ""))
+        return cfg.ai_provider, getattr(cfg, "freellmapi_model", "auto") or "auto"
     raise ValueError(f"Unsupported AI provider: {cfg.ai_provider}")
 
 
@@ -472,18 +480,27 @@ def _request_json(prompt: str, schema: dict, cfg) -> dict:
             except Exception as exc:
                 if attempt + 1 >= AI_REQUEST_MAX_ATTEMPTS or not _is_retryable_ai_error(exc):
                     raise
-                time.sleep(2 ** attempt)
+                time.sleep(_ai_retry_delay(exc, attempt))
         response_text = getattr(response, "text", None)
     else:
         import requests
+
+        endpoint = (
+            "https://integrate.api.nvidia.com/v1/chat/completions"
+            if provider == "nvidia"
+            else _freellmapi_chat_url(cfg.freellmapi_base_url)
+        )
+        api_key = (
+            cfg.api_key_nvidia if provider == "nvidia" else cfg.api_key_freellmapi
+        )
 
         response = None
         for attempt in range(AI_REQUEST_MAX_ATTEMPTS):
             try:
                 response = requests.post(
-                    "https://integrate.api.nvidia.com/v1/chat/completions",
+                    endpoint,
                     headers={
-                        "Authorization": f"Bearer {cfg.api_key_nvidia}",
+                        "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
                     },
                     json={
@@ -498,8 +515,16 @@ def _request_json(prompt: str, schema: dict, cfg) -> dict:
                 break
             except Exception as exc:
                 if attempt + 1 >= AI_REQUEST_MAX_ATTEMPTS or not _is_retryable_ai_error(exc):
+                    if provider == "nvidia" and getattr(exc, "response", None) is not None:
+                        raise RuntimeError(
+                            _nvidia_http_error_message(exc.response, model)
+                        ) from exc
+                    if provider == "freellmapi" and getattr(exc, "response", None) is not None:
+                        raise RuntimeError(
+                            _freellmapi_http_error_message(exc.response, model)
+                        ) from exc
                     raise
-                time.sleep(2 ** attempt)
+                time.sleep(_ai_retry_delay(exc, attempt))
         response_text = response.json()["choices"][0]["message"]["content"]
 
     if not isinstance(response_text, str) or not response_text.strip():
@@ -524,12 +549,107 @@ def _is_retryable_ai_error(exc: Exception) -> bool:
     except (TypeError, ValueError):
         status = None
     if status is not None:
-        return status == 429 or status >= 500
+        return status in {408, 425, 429} or 500 <= status <= 599
     name = type(exc).__name__.lower()
     return any(token in name for token in (
         "timeout", "connectionerror", "connectionreset", "serviceunavailable",
         "resourceexhausted", "deadlineexceeded", "internalservererror",
     ))
+
+
+def _ai_retry_delay(exc: Exception, attempt: int) -> float:
+    """Honor provider retry hints, with a bounded exponential fallback."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    retry_after = headers.get("Retry-After") if headers else None
+    try:
+        if retry_after is not None:
+            return min(60.0, max(0.0, float(retry_after)))
+    except (TypeError, ValueError):
+        pass
+
+    retry_delay = getattr(exc, "retry_delay", None)
+    seconds = getattr(retry_delay, "seconds", retry_delay)
+    try:
+        if seconds is not None:
+            return min(60.0, max(0.0, float(seconds)))
+    except (TypeError, ValueError):
+        pass
+    return min(60.0, float(2 ** (attempt + 1)))
+
+
+def _nvidia_http_error_message(response, model: str) -> str:
+    status = getattr(response, "status_code", "unknown")
+    detail = ""
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            error = payload.get("error", payload.get("detail", payload.get("message", "")))
+            detail = error if isinstance(error, str) else json.dumps(error, ensure_ascii=False)
+    except Exception:
+        detail = str(getattr(response, "text", ""))
+    detail = " ".join(str(detail).split())[:500]
+    if status == 410:
+        explanation = (
+            "NVIDIA reports that this model request is gone. Check the model's current "
+            "NIM availability and API-key access, or retry discovery with another "
+            "configured provider. This is not a transcription failure."
+        )
+    elif status == 429:
+        explanation = "NVIDIA rate-limited this request; wait for the quota window or use another configured provider."
+    elif status in {401, 403}:
+        explanation = "NVIDIA rejected this API key or its access to the selected model."
+    else:
+        explanation = "Check NVIDIA NIM availability and the selected model configuration."
+    suffix = f" Provider detail: {detail}" if detail else ""
+    return (
+        f"NVIDIA NIM request failed with HTTP {status} for model {model}. "
+        f"{explanation}{suffix} Saved transcript and speaker analysis are preserved; "
+        "retrying discovery will reuse them."
+    )
+
+
+def _freellmapi_chat_url(base_url: str) -> str:
+    """Resolve a FreeLLMAPI origin or /v1 base URL to its chat endpoint."""
+    value = str(base_url or "").strip().rstrip("/")
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "FreeLLMAPI base URL must be an http(s) URL without credentials, query, or fragment."
+        )
+    if parsed.path.rstrip("/").endswith("/v1/chat/completions"):
+        return value
+    if parsed.path.rstrip("/").endswith("/v1"):
+        return f"{value}/chat/completions"
+    return f"{value}/v1/chat/completions"
+
+
+def _freellmapi_http_error_message(response, model: str) -> str:
+    status = getattr(response, "status_code", "unknown")
+    detail = ""
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            error = payload.get("error", payload.get("detail", payload.get("message", "")))
+            if isinstance(error, dict):
+                error = error.get("message", error)
+            detail = error if isinstance(error, str) else json.dumps(error, ensure_ascii=False)
+    except Exception:
+        detail = str(getattr(response, "text", ""))
+    detail = " ".join(str(detail).split())[:500]
+    suffix = f" Gateway detail: {detail}" if detail else ""
+    return (
+        f"FreeLLMAPI returned HTTP {status} for model {model}. Check that the FreeLLMAPI "
+        "server is reachable from the Auto Story backend and that the unified key is valid. "
+        f"{suffix} Transcript and speaker analysis remain saved; retry discovery to reuse them."
+    )
 
 
 _STORYLINES_SCHEMA = {

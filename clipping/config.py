@@ -158,7 +158,7 @@ RENDER_OUTPUT_HEIGHT = 1080
 
 # AI Provider
 AI_PROVIDER = "gemini"
-NVIDIA_MODEL = "deepseek-ai/deepseek-v4.1-flash"
+NVIDIA_MODEL = "deepseek-ai/deepseek-v4-pro"
 GEMINI_MODEL = "gemini-3-flash-preview"
 GEMINI_FALLBACK_MODEL = "gemini-2.5-flash"
 
@@ -460,7 +460,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--nvidia-model",
         default=NVIDIA_MODEL,
-        help="Model name for NVIDIA NIM API (e.g. deepseek-ai/deepseek-v4.1-flash).",
+        help="Model name for NVIDIA NIM API (e.g. deepseek-ai/deepseek-v4-pro).",
     )
     p.add_argument("--gemini-model", default=GEMINI_MODEL, help="Gemini model name")
     p.add_argument(

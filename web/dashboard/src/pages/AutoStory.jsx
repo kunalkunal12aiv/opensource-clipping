@@ -96,6 +96,7 @@ function AutoStory() {
   const [diarizationSpeakers, setDiarizationSpeakers] = useState('auto')
   const [whisperModel, setWhisperModel] = useState('small')
   const [provider, setProvider] = useState('gemini')
+  const [retryProvider, setRetryProvider] = useState('')
   const [creating, setCreating] = useState(false)
   const [job, setJob] = useState(null)
   const [stories, setStories] = useState([])
@@ -427,8 +428,10 @@ function AutoStory() {
     try {
       selectionTouched.current = false
       setSelectedStorylineIds([])
-      const updated = await rediscoverAutoStorylines(jobId)
+      const selectedProvider = retryProvider || job?.config?.ai_provider || 'gemini'
+      const updated = await rediscoverAutoStorylines(jobId, selectedProvider)
       setJob(updated)
+      setRetryProvider(selectedProvider)
     } catch (err) {
       setError(err.message)
     } finally {
@@ -838,7 +841,9 @@ function AutoStory() {
   if (!jobId) {
     const providerKeySet = provider === 'gemini'
       ? settings?.google_api_key_set
-      : settings?.nvidia_api_key_set
+      : provider === 'nvidia'
+        ? settings?.nvidia_api_key_set
+        : settings?.freellmapi_api_key_set
     const readyForStart = Boolean(providerKeySet && (!diarizationEnabled || settings?.hf_token_set))
     return (
       <div className="fade-in">
@@ -1029,6 +1034,7 @@ function AutoStory() {
                 >
                   <option value="gemini">Google Gemini</option>
                   <option value="nvidia">NVIDIA NIM</option>
+                  <option value="freellmapi">FreeLLMAPI (unified key)</option>
                 </select>
               </div>
               <div className="form-group">
@@ -1147,7 +1153,8 @@ function AutoStory() {
     || speakerCorrections.length
     || JSON.stringify(speakerMergeDraft) !== JSON.stringify(state.speaker_merges || {}),
   )
-  const active = !TERMINAL_STATUSES.includes(job.status)
+  const active = ['queued', 'downloading', 'transcribing', 'analyzing', 'rendering']
+    .includes(job.status)
   const progress = job.progress?.percent || 0
   const canRetryRender = Boolean(
     (state.stories?.length && state.validation && state.stories.every(story => story.validation))
@@ -1214,19 +1221,46 @@ function AutoStory() {
 
       {job.status === 'awaiting_storyline' && (
         <section className="auto-story-section">
-          <h3>Choose which stories to create</h3>
+          <h3>{state.last_failed_stage ? 'Story discovery needs a retry' : 'Choose which stories to create'}</h3>
           <a className="btn btn-secondary" href={`/api/auto-story/${encodeURIComponent(jobId)}/project`}>
             Download project backup
           </a>
           {state.last_failed_stage && (
-            <div className="auto-story-warning" role="status">
-              {state.message || 'The last stage failed. Update provider settings if needed, then retry discovery.'}
-            </div>
+            <>
+              <div className="auto-story-warning" role="alert">
+                {state.message || 'The AI provider request failed. Your transcript and speaker analysis remain saved.'}
+              </div>
+              {state.last_failed_stage === 'storyline_discovery' && (
+                <div className="form-group">
+                  <label className="form-label" htmlFor="auto-story-retry-provider">AI provider for retry</label>
+                  <select
+                    id="auto-story-retry-provider"
+                    className="form-select"
+                    value={retryProvider || job.config?.ai_provider || 'gemini'}
+                    onChange={event => setRetryProvider(event.target.value)}
+                  >
+                    <option value="gemini" disabled={Boolean(settings && !settings.google_api_key_set)}>
+                      Gemini{settings && !settings.google_api_key_set ? ' · API key not configured' : ''}
+                    </option>
+                    <option value="nvidia" disabled={Boolean(settings && !settings.nvidia_api_key_set)}>
+                      NVIDIA NIM{settings && !settings.nvidia_api_key_set ? ' · API key not configured' : ''}
+                    </option>
+                    <option value="freellmapi" disabled={Boolean(settings && !settings.freellmapi_api_key_set)}>
+                      FreeLLMAPI{settings && !settings.freellmapi_api_key_set ? ' · API key not configured' : ''}
+                    </option>
+                  </select>
+                  <span className="form-hint">
+                    Retrying uses the saved transcript and speaker analysis; it does not rerun transcription or diarization.
+                    {' '}<Link to="/settings">Manage provider keys</Link>.
+                  </span>
+                </div>
+              )}
+            </>
           )}
-          <p className="auto-story-help">
+          {state.storylines?.length > 0 && <p className="auto-story-help">
             Select one or more storylines. All are selected initially; uncheck any you do not want.
             The backend automatically creates and renders them unless you choose manual timing review below.
-          </p>
+          </p>}
           {!!state.speaker_ids?.length && (
             <div className="auto-story-speaker-review">
               <h4>Who is speaking?</h4>
@@ -1437,7 +1471,7 @@ function AutoStory() {
               </article>
             ))}
           </div>
-          {state.storylines?.length === 0 && (
+          {state.storylines?.length === 0 && !state.last_failed_stage && (
             <div className="auto-story-warning">
               No storylines were found. Rerun discovery to ask the AI for a fresh set.
             </div>
@@ -1449,9 +1483,13 @@ function AutoStory() {
               onClick={rerunStorylineDiscovery}
               disabled={rediscovering || selecting}
             >
-              {rediscovering ? <><span className="spinner"></span> Finding new storylines…</> : '🔄 Rerun story discovery'}
+              {rediscovering
+                ? <><span className="spinner"></span> Retrying story discovery…</>
+                : state.last_failed_stage
+                  ? `Retry discovery with ${({ gemini: 'Gemini', nvidia: 'NVIDIA NIM', freellmapi: 'FreeLLMAPI' }[retryProvider || job.config?.ai_provider || 'gemini'])}`
+                  : '🔄 Rerun story discovery'}
             </button>
-            <button
+            {state.storylines?.length > 0 && <button
               type="button"
               className="btn btn-primary"
               onClick={createSelectedStories}
@@ -1467,7 +1505,7 @@ function AutoStory() {
                 : reviewBeforeRender
                   ? `Create ${selectedStorylineIds.length} ${selectedStorylineIds.length === 1 ? 'story plan' : 'story plans'}`
                   : `✅ Create & render ${selectedStorylineIds.length} ${selectedStorylineIds.length === 1 ? 'story' : 'stories'}`}
-            </button>
+            </button>}
           </div>
         </section>
       )}

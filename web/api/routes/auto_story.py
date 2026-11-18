@@ -15,6 +15,7 @@ from starlette.background import BackgroundTask
 from .. import auto_story_projects, auto_story_worker, config_adapter, store, worker
 from ..models import (
     AutoStoryCreateRequest,
+    AutoStoryRediscoveryRequest,
     AutoStoryRecipeRequest,
     AutoStorySelectionRequest,
     AutoStorySpeakerNamesRequest,
@@ -27,6 +28,12 @@ from ..readiness import get_readiness
 from .jobs import _job_to_response
 
 router = APIRouter(prefix="/api/auto-story", tags=["auto-story"])
+
+_PROVIDER_KEYS = {
+    "gemini": "GOOGLE_API_KEY",
+    "nvidia": "NVIDIA_API_KEY",
+    "freellmapi": "FREELLMAPI_API_KEY",
+}
 
 
 def _require_auto_story_job(job_id: str) -> dict:
@@ -55,7 +62,7 @@ async def create_auto_story(req: AutoStoryCreateRequest) -> JobResponse:
         )
 
     provider = req.ai_provider.value
-    provider_key = "GOOGLE_API_KEY" if provider == "gemini" else "NVIDIA_API_KEY"
+    provider_key = _PROVIDER_KEYS[provider]
     if not _required_key(provider_key):
         raise HTTPException(
             status_code=400,
@@ -536,7 +543,10 @@ async def select_storylines(
 
 
 @router.post("/{job_id}/storylines/rediscover", response_model=JobResponse)
-async def rediscover_storylines(job_id: str) -> JobResponse:
+async def rediscover_storylines(
+    job_id: str,
+    req: AutoStoryRediscoveryRequest | None = None,
+) -> JobResponse:
     job = _require_auto_story_job(job_id)
     if job.get("status") != JobStatus.AWAITING_STORYLINE.value:
         raise HTTPException(
@@ -544,6 +554,18 @@ async def rediscover_storylines(job_id: str) -> JobResponse:
             detail="Story discovery can only be rerun before selecting stories.",
         )
     state = dict(job.get("auto_story") or {})
+    current_provider = job.get("config", {}).get("ai_provider", "gemini")
+    provider = req.ai_provider.value if req and req.ai_provider else current_provider
+    provider_key = _PROVIDER_KEYS[provider]
+    if not _required_key(provider_key):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Add {provider_key} in Studio Settings before retrying with {provider.title()}.",
+        )
+    if provider != current_provider:
+        config = dict(job.get("config") or {})
+        config["ai_provider"] = provider
+        store.update_job(job_id, config=config)
     revision = int(state.get("discovery_revision", 0)) + 1
     state.update(
         phase="storyline_discovery",
@@ -553,7 +575,12 @@ async def rediscover_storylines(job_id: str) -> JobResponse:
         selected_storyline_ids=[],
         selected_story_count=0,
         failed_stories=[],
-        message="Rerunning story discovery with a fresh AI request.",
+        last_failed_stage=None,
+        diagnostic_error_type=None,
+        message=(
+            f"Retrying story discovery with {provider.title()}; saved transcript "
+            "and speaker analysis will be reused."
+        ),
     )
     store.update_job(
         job_id,

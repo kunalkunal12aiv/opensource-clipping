@@ -238,7 +238,7 @@ def _restore_archive(archive_path: Path) -> str:
         source_info = source_entries[0][1][0]
         settings = manifest["config"]
         if (
-            settings.get("ai_provider", "gemini") not in {"gemini", "nvidia"}
+            settings.get("ai_provider", "gemini") not in {"gemini", "nvidia", "freellmapi"}
             or settings.get("workflow_mode", "auto") not in {"auto", "choose"}
             or type(settings.get("diarization_enabled", True)) is not bool
             or type(settings.get("target_duration_sec", 60)) is not int

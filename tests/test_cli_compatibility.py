@@ -49,7 +49,7 @@ def test_cli_story_mode_still_accepts_no_url(monkeypatch, tmp_path):
     cfg = config.build_config(["--story-mode"])
     assert cfg.story_mode is True
     assert cfg.url_list == []
-    assert cfg.nvidia_model == "deepseek-ai/deepseek-v4.1-flash"
+    assert cfg.nvidia_model == "deepseek-ai/deepseek-v4-pro"
 
 
 def test_cli_and_studio_use_compatible_model_without_reusing_legacy_cache(monkeypatch, tmp_path):

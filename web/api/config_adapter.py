@@ -29,6 +29,7 @@ from clipping.config import (
     GEMINI_FALLBACK_MODEL,
     MEDIAPIPE_MODEL_FILENAME,
     NAMA_FONT_THUMBNAIL,
+    NVIDIA_MODEL,
     RENDER_OUTPUT_HEIGHT,
     SCALE_KATA_KHUSUS_169,
     SCALE_KATA_KHUSUS_916,
@@ -219,7 +220,15 @@ def build_config_from_payload(
         # AI
         ai_provider=ai_provider,
         api_key_nvidia=env.get("NVIDIA_API_KEY", os.environ.get("NVIDIA_API_KEY", "")),
-        nvidia_model=payload.get("nvidia_model", "deepseek-ai/deepseek-v4-pro"),
+        api_key_freellmapi=env.get(
+            "FREELLMAPI_API_KEY", os.environ.get("FREELLMAPI_API_KEY", "")
+        ),
+        freellmapi_base_url=env.get(
+            "FREELLMAPI_BASE_URL",
+            os.environ.get("FREELLMAPI_BASE_URL", "http://127.0.0.1:3001/v1"),
+        ),
+        freellmapi_model=payload.get("freellmapi_model", "auto"),
+        nvidia_model=payload.get("nvidia_model", NVIDIA_MODEL),
         gemini_model=payload.get("gemini_model", "gemini-3-flash-preview"),
         gemini_fallback_model=payload.get("gemini_fallback_model", GEMINI_FALLBACK_MODEL),
         load_gemini_json=payload.get("load_gemini_json", False),

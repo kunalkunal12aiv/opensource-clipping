@@ -42,7 +42,10 @@ def _persist_api_keys(env_updates: dict[str, str]) -> None:
     api_keys = {
         key: value
         for key, value in env_updates.items()
-        if key in {"GOOGLE_API_KEY", "PEXELS_API_KEY", "HF_TOKEN", "NVIDIA_API_KEY"}
+        if key in {
+            "GOOGLE_API_KEY", "PEXELS_API_KEY", "HF_TOKEN", "NVIDIA_API_KEY",
+            "FREELLMAPI_API_KEY", "FREELLMAPI_BASE_URL",
+        }
     }
     if not api_keys:
         return
@@ -79,12 +82,20 @@ async def get_settings() -> SettingsResponse:
     pexels_key = env.get("PEXELS_API_KEY", os.environ.get("PEXELS_API_KEY", ""))
     hf_token = env.get("HF_TOKEN", os.environ.get("HF_TOKEN", ""))
     nvidia_key = env.get("NVIDIA_API_KEY", os.environ.get("NVIDIA_API_KEY", ""))
+    freellmapi_key = env.get(
+        "FREELLMAPI_API_KEY", os.environ.get("FREELLMAPI_API_KEY", "")
+    )
 
     return SettingsResponse(
         google_api_key_set=bool(google_key),
         pexels_api_key_set=bool(pexels_key),
         hf_token_set=bool(hf_token),
         nvidia_api_key_set=bool(nvidia_key),
+        freellmapi_api_key_set=bool(freellmapi_key),
+        freellmapi_base_url=env.get(
+            "FREELLMAPI_BASE_URL",
+            os.environ.get("FREELLMAPI_BASE_URL", "http://127.0.0.1:3001/v1"),
+        ),
         default_clips=int(env.get("DEFAULT_CLIPS", "7")),
         default_ratio=env.get("DEFAULT_RATIO", "9:16"),
         default_font_style=env.get("DEFAULT_FONT_STYLE", "HORMOZI"),
@@ -108,6 +119,10 @@ async def update_settings(req: SettingsRequest) -> SettingsResponse:
         env_updates["HF_TOKEN"] = req.hf_token
     if req.nvidia_api_key is not None:
         env_updates["NVIDIA_API_KEY"] = req.nvidia_api_key
+    if req.freellmapi_api_key is not None:
+        env_updates["FREELLMAPI_API_KEY"] = req.freellmapi_api_key
+    if req.freellmapi_base_url is not None:
+        env_updates["FREELLMAPI_BASE_URL"] = req.freellmapi_base_url
     if req.default_clips is not None:
         env_updates["DEFAULT_CLIPS"] = str(req.default_clips)
     if req.default_ratio is not None:

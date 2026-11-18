@@ -47,10 +47,12 @@ function Settings() {
   const [pexelsKey, setPexelsKey] = useState('')
   const [hfToken, setHfToken] = useState('')
   const [nvidiaKey, setNvidiaKey] = useState('')
+  const [freellmapiKey, setFreellmapiKey] = useState('')
+  const [freellmapiBaseUrl, setFreellmapiBaseUrl] = useState('http://127.0.0.1:3001/v1')
 
   useEffect(() => {
     fetchSettings()
-      .then(data => { setSettings(data); setLoading(false) })
+      .then(data => { setSettings(data); setFreellmapiBaseUrl(data.freellmapi_base_url || 'http://127.0.0.1:3001/v1'); setLoading(false) })
       .catch(() => setLoading(false))
   }, [])
 
@@ -64,6 +66,8 @@ function Settings() {
       if (pexelsKey) payload.pexels_api_key = pexelsKey
       if (hfToken) payload.hf_token = hfToken
       if (nvidiaKey) payload.nvidia_api_key = nvidiaKey
+      if (freellmapiKey) payload.freellmapi_api_key = freellmapiKey
+      if (freellmapiBaseUrl !== (settings?.freellmapi_base_url || 'http://127.0.0.1:3001/v1')) payload.freellmapi_base_url = freellmapiBaseUrl
 
       if (Object.keys(payload).length === 0) {
         setMsg('Tidak ada perubahan')
@@ -77,6 +81,7 @@ function Settings() {
       setPexelsKey('')
       setHfToken('')
       setNvidiaKey('')
+      setFreellmapiKey('')
       setMsg('✅ Settings berhasil diperbarui!')
     } catch (err) {
       setMsg('❌ Gagal menyimpan: ' + err.message)
@@ -161,6 +166,29 @@ function Settings() {
                 placeholder="For NVIDIA NIM provider (optional)"
                 isSet={settings?.nvidia_api_key_set}
               />
+            </div>
+
+            <div className="form-group">
+              <label className="form-label">
+                FreeLLMAPI Unified Master Key
+                {settings?.freellmapi_api_key_set && <span style={{ color: 'var(--success)', marginLeft: '8px' }}>✅ Set</span>}
+              </label>
+              <PasswordInput
+                value={freellmapiKey}
+                onChange={setFreellmapiKey}
+                placeholder="Paste your FreeLLMAPI unified key"
+                isSet={settings?.freellmapi_api_key_set}
+              />
+              <label className="form-label" htmlFor="freellmapi-base-url" style={{ marginTop: '12px' }}>FreeLLMAPI base URL</label>
+              <input
+                id="freellmapi-base-url"
+                className="form-input"
+                type="url"
+                value={freellmapiBaseUrl}
+                onChange={event => setFreellmapiBaseUrl(event.target.value)}
+                placeholder="http://127.0.0.1:3001/v1"
+              />
+              <p className="form-hint">The Auto Story backend must be able to reach this URL. Use your server or tunnel address when the backend runs remotely.</p>
             </div>
           </div>
 

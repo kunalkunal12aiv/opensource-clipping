@@ -15,6 +15,8 @@ services:
       - PEXELS_API_KEY=${PEXELS_API_KEY:-}
       - HF_TOKEN=${HF_TOKEN:-}
       - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
+      - FREELLMAPI_API_KEY=${FREELLMAPI_API_KEY:-}
+      - FREELLMAPI_BASE_URL=${FREELLMAPI_BASE_URL:-http://127.0.0.1:3001/v1}
       - MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS:-1}
     restart: unless-stopped
     # Uncomment below for GPU support (requires NVIDIA Container Toolkit)

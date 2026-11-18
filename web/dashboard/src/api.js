@@ -131,9 +131,13 @@ export async function selectAutoStorylines(jobId, storylineIds, reviewBeforeRend
   })
 }
 
-export async function rediscoverAutoStorylines(jobId) {
+export async function rediscoverAutoStorylines(jobId, aiProvider) {
   return autoStoryRequest(`/${encodeURIComponent(jobId)}/storylines/rediscover`, {
     method: 'POST',
+    ...(aiProvider ? {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ai_provider: aiProvider }),
+    } : {}),
   })
 }
 

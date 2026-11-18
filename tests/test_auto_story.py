@@ -1098,6 +1098,119 @@ def test_ai_request_retries_transient_provider_errors_only(monkeypatch):
 
     assert not auto_story._is_retryable_ai_error(Unauthorized())
 
+    class Gone(Exception):
+        status_code = 410
+
+    assert not auto_story._is_retryable_ai_error(Gone())
+
+
+def test_nvidia_gone_error_explains_provider_issue_and_saved_checkpoint():
+    class Response:
+        status_code = 410
+        text = "model deployment retired"
+
+        def json(self):
+            return {"detail": self.text}
+
+    message = auto_story._nvidia_http_error_message(Response(), "test/model")
+
+    assert "HTTP 410" in message
+    assert "NVIDIA reports that this model request is gone" in message
+    assert "Saved transcript and speaker analysis are preserved" in message
+
+
+def test_nvidia_gone_request_surfaces_model_error_without_retry(monkeypatch):
+    import requests
+
+    calls = []
+
+    class Response:
+        status_code = 410
+        headers = {}
+        text = "deployment retired"
+
+        def json(self):
+            return {"detail": self.text}
+
+        def raise_for_status(self):
+            error = requests.HTTPError("410 Client Error")
+            error.response = self
+            raise error
+
+    monkeypatch.setattr(requests, "post", lambda *_args, **_kwargs: calls.append(1) or Response())
+    cfg = SimpleNamespace(
+        ai_provider="nvidia",
+        api_key_nvidia="test-key",
+        nvidia_model="test/model",
+    )
+
+    with pytest.raises(RuntimeError, match="NVIDIA reports that this model request is gone"):
+        auto_story._request_json("prompt", {}, cfg)
+    assert calls == [1]
+
+
+def test_ai_retry_delay_honors_retry_after_and_caps_it():
+    class Response:
+        headers = {"Retry-After": "90"}
+
+    class RateLimit(Exception):
+        response = Response()
+
+    assert auto_story._ai_retry_delay(RateLimit(), 0) == 60.0
+
+
+def test_freellmapi_url_resolves_origin_and_v1_base():
+    assert auto_story._freellmapi_chat_url("http://localhost:3001") == (
+        "http://localhost:3001/v1/chat/completions"
+    )
+    assert auto_story._freellmapi_chat_url("https://gateway.example/v1/") == (
+        "https://gateway.example/v1/chat/completions"
+    )
+
+
+def test_freellmapi_request_uses_unified_key_and_auto_model(monkeypatch):
+    import requests
+
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": '{"ok": true}'}}]}
+
+    def post(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr(requests, "post", post)
+    cfg = SimpleNamespace(
+        ai_provider="freellmapi",
+        api_key_freellmapi="unified-test-key",
+        freellmapi_base_url="http://localhost:3001/v1",
+        freellmapi_model="auto",
+    )
+
+    assert auto_story._request_json("prompt", {}, cfg) == {"ok": True}
+    assert captured["url"] == "http://localhost:3001/v1/chat/completions"
+    assert captured["headers"]["Authorization"] == "Bearer unified-test-key"
+    assert captured["json"]["model"] == "auto"
+
+
+def test_freellmapi_requires_key_and_safe_http_url():
+    cfg = SimpleNamespace(
+        ai_provider="freellmapi",
+        api_key_freellmapi="",
+        freellmapi_base_url="http://localhost:3001/v1",
+    )
+    with pytest.raises(RuntimeError, match="FREELLMAPI_API_KEY"):
+        auto_story._provider_model(cfg)
+
+    with pytest.raises(ValueError, match="base URL"):
+        auto_story._freellmapi_chat_url("file:///tmp/gateway")
+
 
 def test_storyline_and_beat_ai_passes_reuse_cached_responses(monkeypatch, tmp_path):
     words = [
